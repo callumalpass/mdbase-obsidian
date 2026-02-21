@@ -1,0 +1,156 @@
+.mdbase-issues-view {
+  padding: 0.75rem;
+  overflow: auto;
+}
+
+.mdbase-issues-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+  gap: 0.5rem;
+}
+
+.mdbase-issues-count {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.mdbase-issue-file {
+  margin-top: 0.75rem;
+  margin-bottom: 0.25rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.mdbase-issue-item {
+  border: 1px solid var(--background-modifier-border);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  margin-bottom: 0.45rem;
+  cursor: pointer;
+}
+
+.mdbase-issue-item[data-severity="error"] {
+  border-left-color: var(--text-error);
+}
+
+.mdbase-issue-item[data-severity="warn"] {
+  border-left-color: var(--text-warning);
+}
+
+.mdbase-issue-code {
+  font-family: var(--font-monospace);
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.mdbase-issue-message {
+  margin-top: 0.2rem;
+  font-size: 0.9rem;
+}
+
+.mdbase-empty {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.mdbase-type-editor-modal {
+  max-height: 78vh;
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+.mdbase-type-editor-modal h2,
+.mdbase-type-editor-modal h3,
+.mdbase-type-editor-modal h4 {
+  margin-top: 0.9rem;
+  margin-bottom: 0.45rem;
+}
+
+.mdbase-type-editor-modal .setting-item {
+  border-top: 0;
+  padding-top: 0.45rem;
+  padding-bottom: 0.45rem;
+}
+
+.mdbase-type-editor-modal .setting-item-control {
+  gap: 0.4rem;
+}
+
+.mdbase-type-editor-modal textarea {
+  min-height: 5.5rem;
+}
+
+.mdbase-type-editor-modal .prompt-input,
+.mdbase-type-editor-modal input[type="text"],
+.mdbase-type-editor-modal textarea,
+.mdbase-type-editor-modal select {
+  width: 100%;
+}
+
+.mdbase-type-fields {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.mdbase-type-field-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 0.45rem 0.55rem;
+}
+
+.mdbase-type-field-label {
+  font-family: var(--font-monospace);
+  font-size: 0.84rem;
+  overflow-wrap: anywhere;
+}
+
+.mdbase-type-field-controls {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.mdbase-type-add-field .setting-item-info {
+  flex: 1;
+}
+
+.mdbase-type-picker-suggestion {
+  display: grid;
+  gap: 0.1rem;
+}
+
+.mdbase-type-picker-name {
+  font-weight: 600;
+}
+
+.mdbase-type-picker-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.mdbase-type-picker-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mdbase-type-picker-count {
+  flex: 0 0 auto;
+}
+
+.mdbase-type-picker-match {
+  color: var(--text-faint);
+  font-size: 0.75rem;
+  font-family: var(--font-monospace);
+}
