@@ -1,0 +1,42 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  plugin:
+    name: Obsidian plugin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Validate release assets
+        run: >-
+          node -e "const fs=require('node:fs'); for (const file of
+          ['main.js','manifest.json','styles.css']) { if
+          (!fs.existsSync(file) || fs.statSync(file).size === 0) throw new
+          Error('Missing or empty release asset: '+file); }"
+      - name: Upload plugin assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdbase-obsidian-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            main.js
+            manifest.json
+            styles.css

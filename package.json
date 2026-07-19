@@ -29,7 +29,7 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
-    "@callumalpass/mdbase-runtime": "file:../mdbase-spec/packages/runtime-contracts",
+    "@callumalpass/mdbase-runtime": "0.1.0-rc.1",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "picomatch": "^4.0.5"
