@@ -8,6 +8,8 @@ export interface TypeEditorField {
 }
 
 export interface TypeEditorModel {
+  specProfile?: "v0.2" | "v0.3";
+  originalFrontmatter?: Record<string, unknown>;
   name: string;
   description: string;
   extendsType: string;

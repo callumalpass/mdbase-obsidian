@@ -1,0 +1,24 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "target": "ES2020",
+    "esModuleInterop": true,
+    "outDir": ".test-dist",
+    "rootDir": ".",
+    "inlineSourceMap": false,
+    "inlineSources": false,
+    "skipLibCheck": true,
+    "types": [
+      "node"
+    ],
+    "lib": [
+      "DOM",
+      "ES2020"
+    ]
+  },
+  "include": [
+    "src/mdbaseCore.ts",
+    "test/**/*.ts"
+  ]
+}

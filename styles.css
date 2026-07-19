@@ -11,6 +11,24 @@
   gap: 0.5rem;
 }
 
+.mdbase-issues-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.mdbase-issues-controls {
+  display: grid;
+  grid-template-columns: 11rem 1fr;
+  gap: 0.45rem;
+  margin-bottom: 0.6rem;
+}
+
+.mdbase-issues-severity,
+.mdbase-issues-query {
+  width: 100%;
+}
+
 .mdbase-issues-count {
   font-size: 0.85rem;
   color: var(--text-muted);
@@ -49,6 +67,13 @@
 .mdbase-issue-message {
   margin-top: 0.2rem;
   font-size: 0.9rem;
+}
+
+.mdbase-issue-actions {
+  margin-top: 0.45rem;
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
 }
 
 .mdbase-empty {

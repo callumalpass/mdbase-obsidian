@@ -1,6 +1,7 @@
 import {
   App,
   ItemView,
+  MarkdownView,
   Modal,
   Notice,
   parseYaml,
@@ -14,6 +15,12 @@ import {
   stringifyYaml,
 } from "obsidian";
 import {
+  DEFAULT_DENY_RUNTIME_POLICY,
+  InMemoryRuntimeHost,
+  type MdbaseRuntimeHostApi,
+  type MdbaseRuntimePolicyInfo,
+} from "@callumalpass/mdbase-runtime";
+import {
   MdbaseConfig,
   MdbaseFieldDef,
   MdbaseIssue,
@@ -23,15 +30,22 @@ import {
   coerceFieldInput,
   createNoteFromType,
   ensureCollectionInitialized,
+  fieldsFromV03Schema,
   formatMarkdown,
   getPromptFields,
+  getTopLevelFieldFromIssuePath,
   loadMdbaseConfig,
   loadTypeDefinitions,
   parseFrontmatter,
+  schemaFromV03Fields,
   validateCollection,
   validateFile,
 } from "./src/mdbaseCore";
 import { TypeEditorField, TypeEditorModal, TypeEditorModel } from "./src/typeEditorModal";
+import {
+  loadSelectedRuntimePolicy,
+  type RuntimePolicyDiagnostic,
+} from "./src/runtimePolicy";
 
 const MDBASE_ISSUES_VIEW = "mdbase-issues-view";
 
@@ -92,8 +106,24 @@ function toTypeEditorModel(
   body: string,
   fallbackName: string,
 ): TypeEditorModel {
-  const fields = toTypeEditorFields(frontmatter.fields);
-  const strictRaw = frontmatter.strict;
+  const isV03 = frontmatter.kind === "mdbase.type";
+  const schemaWrapper = isV03 && frontmatter.schema && typeof frontmatter.schema === "object" && !Array.isArray(frontmatter.schema)
+    ? frontmatter.schema as Record<string, unknown>
+    : {};
+  const schemaValue = schemaWrapper.value && typeof schemaWrapper.value === "object" && !Array.isArray(schemaWrapper.value)
+    ? schemaWrapper.value as Record<string, unknown>
+    : {};
+  const collection = isV03 && frontmatter.collection && typeof frontmatter.collection === "object" && !Array.isArray(frontmatter.collection)
+    ? frontmatter.collection as Record<string, unknown>
+    : {};
+  const display = collection.display && typeof collection.display === "object" && !Array.isArray(collection.display)
+    ? collection.display as Record<string, unknown>
+    : {};
+  const pathPolicy = collection.path && typeof collection.path === "object" && !Array.isArray(collection.path)
+    ? collection.path as Record<string, unknown>
+    : {};
+  const fields = toTypeEditorFields(isV03 ? fieldsFromV03Schema(schemaValue) : frontmatter.fields);
+  const strictRaw = isV03 ? schemaValue.additionalProperties === false : frontmatter.strict;
   const strictMode = strictRaw === "warn" ? "warn" : strictRaw === true;
 
   const match = frontmatter.match && typeof frontmatter.match === "object" && !Array.isArray(frontmatter.match)
@@ -128,13 +158,19 @@ function toTypeEditorModel(
   }
 
   return {
+    specProfile: isV03 ? "v0.3" : "v0.2",
+    originalFrontmatter: JSON.parse(JSON.stringify(frontmatter)),
     name: typeof frontmatter.name === "string" && frontmatter.name.trim().length > 0 ? frontmatter.name : fallbackName,
     description: typeof frontmatter.description === "string" ? frontmatter.description : "",
     extendsType: typeof frontmatter.extends === "string" ? frontmatter.extends : "",
-    displayNameKey: typeof frontmatter.display_name_key === "string" ? frontmatter.display_name_key : "",
+    displayNameKey: isV03
+      ? typeof display.name_field === "string" ? display.name_field : ""
+      : typeof frontmatter.display_name_key === "string" ? frontmatter.display_name_key : "",
     strictMode,
-    pathPattern: typeof frontmatter.path_pattern === "string" ? frontmatter.path_pattern : "",
-    filenamePattern: typeof frontmatter.filename_pattern === "string" ? frontmatter.filename_pattern : "",
+    pathPattern: isV03
+      ? typeof pathPolicy.pattern === "string" ? pathPolicy.pattern : ""
+      : typeof frontmatter.path_pattern === "string" ? frontmatter.path_pattern : "",
+    filenamePattern: isV03 ? "" : typeof frontmatter.filename_pattern === "string" ? frontmatter.filename_pattern : "",
     matchPathGlob: typeof match.path_glob === "string" ? match.path_glob : "",
     matchFieldsPresent: Array.isArray(match.fields_present)
       ? match.fields_present.map((entry) => String(entry)).join(", ")
@@ -147,6 +183,54 @@ function toTypeEditorModel(
 }
 
 function buildTypeFrontmatterFromModel(model: TypeEditorModel): Record<string, unknown> {
+  if (model.specProfile === "v0.3") {
+    const original = model.originalFrontmatter
+      ? JSON.parse(JSON.stringify(model.originalFrontmatter)) as Record<string, unknown>
+      : {};
+    const originalSchemaWrapper = original.schema && typeof original.schema === "object" && !Array.isArray(original.schema)
+      ? original.schema as Record<string, unknown>
+      : {};
+    const originalSchema = originalSchemaWrapper.value && typeof originalSchemaWrapper.value === "object" && !Array.isArray(originalSchemaWrapper.value)
+      ? originalSchemaWrapper.value as Record<string, unknown>
+      : {};
+    const fieldRecord: Record<string, MdbaseFieldDef> = {};
+    for (const field of model.fields) fieldRecord[field.name] = field.definition as MdbaseFieldDef;
+    const frontmatter: Record<string, unknown> = {
+      ...original,
+      kind: "mdbase.type",
+      name: model.name,
+      version: typeof original.version === "number" ? original.version : 1,
+      schema: {
+        dialect: "json-schema-2020-12",
+        value: schemaFromV03Fields(fieldRecord, originalSchema, model.strictMode === true),
+      },
+    };
+    if (model.description) frontmatter.description = model.description;
+    else delete frontmatter.description;
+    if (model.matchPathGlob || model.matchFieldsPresent || model.matchWhere.trim()) {
+      const match: Record<string, unknown> = {};
+      if (model.matchPathGlob) match.path_glob = model.matchPathGlob;
+      const fieldsPresent = model.matchFieldsPresent.split(",").map((value) => value.trim()).filter(Boolean);
+      if (fieldsPresent.length > 0) match.fields_present = fieldsPresent;
+      if (model.matchWhere.trim()) match.where = parseYaml(model.matchWhere.trim());
+      frontmatter.match = match;
+    } else {
+      delete frontmatter.match;
+    }
+    const collection = frontmatter.collection && typeof frontmatter.collection === "object" && !Array.isArray(frontmatter.collection)
+      ? { ...(frontmatter.collection as Record<string, unknown>) }
+      : {};
+    if (model.displayNameKey) collection.display = { name_field: model.displayNameKey };
+    else delete collection.display;
+    if (model.pathPattern) collection.path = { pattern: model.pathPattern };
+    else delete collection.path;
+    if (Object.keys(collection).length > 0) frontmatter.collection = collection;
+    else delete frontmatter.collection;
+    for (const legacyKey of ["fields", "strict", "extends", "display_name_key", "path_pattern", "filename_pattern"]) {
+      delete frontmatter[legacyKey];
+    }
+    return frontmatter;
+  }
   const frontmatter: Record<string, unknown> = {
     name: model.name,
   };
@@ -186,6 +270,10 @@ function buildTypeFrontmatterFromModel(model: TypeEditorModel): Record<string, u
   }
 
   return frontmatter;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 class TextPromptModal extends Modal {
@@ -333,7 +421,6 @@ class TypeSuggestModal extends SuggestModal<MdbaseTypeDef> {
   }
 
   onClose(): void {
-    // Obsidian SuggestModal can close before selection callback; defer cancellation check.
     window.setTimeout(() => {
       if (!this.resultHandled) {
         this.onResult({ type: "cancelled" });
@@ -358,6 +445,8 @@ function pickType(app: App, typeDefs: MdbaseTypeDef[]): Promise<MdbaseTypeDef | 
 
 class MdbaseIssuesView extends ItemView {
   plugin: MdbasePlugin;
+  private severityFilter: "all" | "error" | "warn" = "all";
+  private query = "";
 
   constructor(leaf: WorkspaceLeaf, plugin: MdbasePlugin) {
     super(leaf);
@@ -390,28 +479,66 @@ class MdbaseIssuesView extends ItemView {
     const header = container.createDiv({ cls: "mdbase-issues-header" });
     header.createEl("h3", { text: "mdbase Issues" });
 
-    const refreshButton = header.createEl("button", { text: "Refresh" });
+    const headerActions = header.createDiv({ cls: "mdbase-issues-header-actions" });
+    const refreshButton = headerActions.createEl("button", { text: "Refresh" });
     refreshButton.addClass("mod-cta");
     refreshButton.onclick = () => {
       void this.plugin.runCollectionValidation(false);
     };
 
+    const controls = container.createDiv({ cls: "mdbase-issues-controls" });
+
+    const severitySelect = controls.createEl("select");
+    severitySelect.addClass("mdbase-issues-severity");
+    severitySelect.createEl("option", { value: "all", text: "All severities" });
+    severitySelect.createEl("option", { value: "error", text: "Errors only" });
+    severitySelect.createEl("option", { value: "warn", text: "Warnings only" });
+    severitySelect.value = this.severityFilter;
+    severitySelect.onchange = () => {
+      const next = severitySelect.value;
+      if (next === "error" || next === "warn" || next === "all") {
+        this.severityFilter = next;
+      }
+      this.render();
+    };
+
+    const queryInput = controls.createEl("input", { type: "search" });
+    queryInput.addClass("mdbase-issues-query");
+    queryInput.placeholder = "Filter by path, code, message, field";
+    queryInput.value = this.query;
+    queryInput.oninput = () => {
+      this.query = queryInput.value;
+      this.render();
+    };
+
     const issues = this.plugin.getIssues();
-    container.createDiv({
-      cls: "mdbase-issues-count",
-      text: `${issues.length} issue${issues.length === 1 ? "" : "s"}`,
+    const normalizedQuery = this.query.trim().toLowerCase();
+    const filtered = issues.filter((issue) => {
+      if (this.severityFilter !== "all" && issue.severity !== this.severityFilter) return false;
+      if (!normalizedQuery) return true;
+
+      const haystack = `${issue.path} ${issue.code} ${issue.message} ${issue.field ?? ""}`.toLowerCase();
+      return haystack.includes(normalizedQuery);
     });
 
-    if (issues.length === 0) {
+    container.createDiv({
+      cls: "mdbase-issues-count",
+      text:
+        filtered.length === issues.length
+          ? `${filtered.length} issue${filtered.length === 1 ? "" : "s"}`
+          : `${filtered.length} of ${issues.length} issue${issues.length === 1 ? "" : "s"}`,
+    });
+
+    if (filtered.length === 0) {
       container.createDiv({
         cls: "mdbase-empty",
-        text: "No validation issues.",
+        text: issues.length === 0 ? "No validation issues." : "No issues match current filters.",
       });
       return;
     }
 
     const grouped = new Map<string, MdbaseIssue[]>();
-    for (const issue of issues) {
+    for (const issue of filtered) {
       const current = grouped.get(issue.path) ?? [];
       current.push(issue);
       grouped.set(issue.path, current);
@@ -433,8 +560,26 @@ class MdbaseIssuesView extends ItemView {
           text: issue.message,
         });
 
+        const actions = item.createDiv({ cls: "mdbase-issue-actions" });
+        const openButton = actions.createEl("button", {
+          text: issue.field ? "Open field" : "Open file",
+        });
+        openButton.onclick = (event) => {
+          event.stopPropagation();
+          void this.plugin.openIssue(issue);
+        };
+
+        const quickFixLabel = this.plugin.getQuickFixLabel(issue);
+        if (quickFixLabel) {
+          const quickFixButton = actions.createEl("button", { text: quickFixLabel });
+          quickFixButton.onclick = (event) => {
+            event.stopPropagation();
+            void this.plugin.applyQuickFix(issue);
+          };
+        }
+
         item.onclick = () => {
-          void this.plugin.openFileByPath(path);
+          void this.plugin.openIssue(issue);
         };
       }
     }
@@ -486,13 +631,54 @@ class MdbaseSettingTab extends PluginSettingTab {
   }
 }
 
+interface LoadedSchema {
+  config: MdbaseConfig;
+  types: Map<string, MdbaseTypeDef>;
+}
+
+export interface MdbaseObsidianApiV1 {
+  readonly apiVersion: 1;
+  readonly runtime: MdbaseRuntimeHostApi;
+  getRuntimeStatus(): {
+    policyId: string;
+    policyPath?: string;
+    diagnostics: RuntimePolicyDiagnostic[];
+  };
+}
+
 export default class MdbasePlugin extends Plugin {
+  readonly api: MdbaseObsidianApiV1;
   settings: MdbasePluginSettings;
   private issueMap = new Map<string, MdbaseIssue[]>();
   private statusBarEl: HTMLElement;
+  private schemaCache: LoadedSchema | null = null;
+  private schemaLoadPromise: Promise<LoadedSchema | null> | null = null;
+  private pendingSaveValidations = new Map<string, number>();
+  private readonly saveValidationDebounceMs = 250;
+  private runtimePolicy: MdbaseRuntimePolicyInfo = {
+    ...DEFAULT_DENY_RUNTIME_POLICY,
+    capabilities: { ...DEFAULT_DENY_RUNTIME_POLICY.capabilities },
+  };
+  private runtimePolicyPath: string | undefined;
+  private runtimePolicyDiagnostics: RuntimePolicyDiagnostic[] = [];
+  private runtimePolicyRefreshGeneration = 0;
+
+  constructor(app: App, manifest: import("obsidian").PluginManifest) {
+    super(app, manifest);
+    this.api = {
+      apiVersion: 1,
+      runtime: new InMemoryRuntimeHost({ policyResolver: () => this.runtimePolicy }),
+      getRuntimeStatus: () => ({
+        policyId: this.runtimePolicy.id,
+        policyPath: this.runtimePolicyPath,
+        diagnostics: this.runtimePolicyDiagnostics.map((diagnostic) => ({ ...diagnostic })),
+      }),
+    };
+  }
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    await this.refreshRuntimePolicy();
 
     this.statusBarEl = this.addStatusBarItem();
     this.updateStatusBar();
@@ -550,9 +736,29 @@ export default class MdbasePlugin extends Plugin {
 
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
-        if (!this.settings.validateOnSave) return;
-        if (!(file instanceof TFile) || file.extension !== "md") return;
-        void this.validateFileAndStore(file, "save");
+        if (!(file instanceof TFile)) return;
+        this.onVaultModify(file);
+      }),
+    );
+
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        if (!(file instanceof TFile)) return;
+        this.onVaultRename(file, oldPath);
+      }),
+    );
+
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (!(file instanceof TFile)) return;
+        this.onVaultDelete(file);
+      }),
+    );
+
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        if (!(file instanceof TFile)) return;
+        this.onVaultCreate(file);
       }),
     );
 
@@ -571,7 +777,9 @@ export default class MdbasePlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    await this.api.runtime.dispose();
     this.app.workspace.getLeavesOfType(MDBASE_ISSUES_VIEW).forEach((leaf) => leaf.detach());
+    this.clearAllPendingSaveValidations();
   }
 
   async loadSettings(): Promise<void> {
@@ -585,17 +793,116 @@ export default class MdbasePlugin extends Plugin {
   getIssues(): MdbaseIssue[] {
     return Array.from(this.issueMap.values())
       .flat()
-      .sort((a, b) => a.path.localeCompare(b.path) || a.severity.localeCompare(b.severity));
+      .sort((a, b) => a.path.localeCompare(b.path) || a.severity.localeCompare(b.severity) || a.code.localeCompare(b.code));
   }
 
-  async openFileByPath(path: string): Promise<void> {
+  async openIssue(issue: MdbaseIssue): Promise<void> {
+    await this.openFileByPath(issue.path, issue.field);
+  }
+
+  getQuickFixLabel(issue: MdbaseIssue): string | null {
+    if (issue.code === "missing_frontmatter") return "Add frontmatter";
+    if (["unknown_field", "schema_additional_properties"].includes(issue.code) && issue.field) return "Remove field";
+    if (["missing_required", "schema_required"].includes(issue.code) && issue.field) return "Add placeholder";
+    return null;
+  }
+
+  async applyQuickFix(issue: MdbaseIssue): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(issue.path);
+    if (!(file instanceof TFile)) {
+      new Notice(`File not found: ${issue.path}`);
+      return;
+    }
+
+    const raw = await this.app.vault.cachedRead(file);
+    const parsed = parseFrontmatter(raw);
+
+    if (issue.code === "missing_frontmatter") {
+      if (parsed.hasFrontmatter && !parsed.error) {
+        new Notice("File already has frontmatter.");
+        return;
+      }
+
+      await this.app.vault.modify(file, `${formatMarkdown({}, raw)}\n`);
+      new Notice(`Added frontmatter to ${file.basename}`);
+      await this.validateFileAndStore(file, "manual");
+      return;
+    }
+
+    if (parsed.error) {
+      new Notice(`Cannot apply quick fix: invalid frontmatter (${parsed.error})`);
+      return;
+    }
+
+    if (["unknown_field", "schema_additional_properties"].includes(issue.code) && issue.field) {
+      const key = getTopLevelFieldFromIssuePath(issue.field);
+      if (!(key in parsed.frontmatter)) {
+        new Notice(`Field '${key}' not found in frontmatter.`);
+        return;
+      }
+
+      delete parsed.frontmatter[key];
+      await this.app.vault.modify(file, `${formatMarkdown(parsed.frontmatter, parsed.body)}\n`);
+      new Notice(`Removed '${key}' from ${file.basename}`);
+      await this.validateFileAndStore(file, "manual");
+      return;
+    }
+
+    if (["missing_required", "schema_required"].includes(issue.code) && issue.field) {
+      const key = getTopLevelFieldFromIssuePath(issue.field);
+      if (parsed.frontmatter[key] === undefined) {
+        parsed.frontmatter[key] = "TODO";
+      }
+
+      const body = parsed.hasFrontmatter ? parsed.body : raw;
+      await this.app.vault.modify(file, `${formatMarkdown(parsed.frontmatter, body)}\n`);
+      new Notice(`Added placeholder '${key}' to ${file.basename}`);
+      await this.validateFileAndStore(file, "manual");
+      return;
+    }
+
+    new Notice("No quick fix available for this issue.");
+  }
+
+  async openFileByPath(path: string, field?: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) {
       new Notice(`File not found: ${path}`);
       return;
     }
 
-    await this.app.workspace.getLeaf(true).openFile(file);
+    const leaf = this.app.workspace.getLeaf(true);
+    await leaf.openFile(file);
+    if (field) {
+      this.revealFrontmatterField(file, field);
+    }
+  }
+
+  private revealFrontmatterField(file: TFile, fieldPath: string): void {
+    const leaf = this.app.workspace.getMostRecentLeaf();
+    if (!leaf) return;
+    if (!(leaf.view instanceof MarkdownView)) return;
+
+    const view = leaf.view;
+    if (!(view.file instanceof TFile) || view.file.path !== file.path) return;
+
+    const editor = view.editor;
+    const totalLines = editor.lineCount();
+    if (totalLines < 3) return;
+
+    const targetKey = getTopLevelFieldFromIssuePath(fieldPath);
+    const matcher = new RegExp(`^\\s*${escapeRegExp(targetKey)}\\s*:`);
+
+    if (editor.getLine(0).trim() !== "---") return;
+    for (let line = 1; line < totalLines; line += 1) {
+      const value = editor.getLine(line);
+      if (value.trim() === "---") break;
+      if (matcher.test(value)) {
+        editor.setCursor({ line, ch: 0 });
+        editor.scrollIntoView({ from: { line, ch: 0 }, to: { line, ch: 0 } }, true);
+        return;
+      }
+    }
   }
 
   private updateStatusBar(): void {
@@ -644,24 +951,188 @@ export default class MdbasePlugin extends Plugin {
     this.refreshIssueViews();
   }
 
-  private async requireConfigAndTypes(): Promise<{ config: MdbaseConfig; types: Map<string, MdbaseTypeDef> } | null> {
-    const config = await loadMdbaseConfig(this.app.vault);
-    if (!config) {
-      new Notice("No mdbase.yaml found. Run 'mdbase: Initialize collection' first.");
+  private clearFileIssues(path: string): void {
+    if (!this.issueMap.has(path)) return;
+    this.issueMap.delete(path);
+    this.refreshIssueViews();
+  }
+
+  private moveFileIssues(oldPath: string, newPath: string): void {
+    const current = this.issueMap.get(oldPath);
+    if (!current) return;
+
+    this.issueMap.delete(oldPath);
+    this.issueMap.set(
+      newPath,
+      current.map((issue) => ({
+        ...issue,
+        path: newPath,
+      })),
+    );
+    this.refreshIssueViews();
+  }
+
+  private clearAllPendingSaveValidations(): void {
+    for (const handle of this.pendingSaveValidations.values()) {
+      window.clearTimeout(handle);
+    }
+    this.pendingSaveValidations.clear();
+  }
+
+  private clearPendingSaveValidation(path: string): void {
+    const existing = this.pendingSaveValidations.get(path);
+    if (existing != null) {
+      window.clearTimeout(existing);
+      this.pendingSaveValidations.delete(path);
+    }
+  }
+
+  private scheduleSaveValidation(file: TFile): void {
+    this.clearPendingSaveValidation(file.path);
+
+    const handle = window.setTimeout(() => {
+      this.pendingSaveValidations.delete(file.path);
+      void this.validateFileAndStore(file, "save");
+    }, this.saveValidationDebounceMs);
+
+    this.pendingSaveValidations.set(file.path, handle);
+  }
+
+  private isSchemaRelevantPath(path: string): boolean {
+    const normalized = normalizePath(path);
+    if (normalized === "mdbase.yaml") return true;
+
+    const possibleFolders = new Set<string>(["_types"]);
+    if (this.schemaCache) {
+      possibleFolders.add(normalizePath(this.schemaCache.config.settings.types_folder));
+    }
+
+    for (const folder of possibleFolders) {
+      if (normalized === folder || normalized.startsWith(`${folder}/`)) return true;
+    }
+
+    return false;
+  }
+
+  private invalidateSchemaCache(): void {
+    this.schemaCache = null;
+    this.schemaLoadPromise = null;
+  }
+
+  private async getConfigAndTypes(forceReload = false): Promise<LoadedSchema | null> {
+    if (forceReload) {
+      this.invalidateSchemaCache();
+    }
+
+    if (this.schemaCache) return this.schemaCache;
+    if (this.schemaLoadPromise) return this.schemaLoadPromise;
+
+    this.schemaLoadPromise = (async () => {
+      const config = await loadMdbaseConfig(this.app.vault);
+      if (!config) return null;
+      const types = await loadTypeDefinitions(this.app.vault, config);
+      return { config, types };
+    })();
+
+    try {
+      const loaded = await this.schemaLoadPromise;
+      if (loaded) this.schemaCache = loaded;
+      return loaded;
+    } finally {
+      this.schemaLoadPromise = null;
+    }
+  }
+
+  private async requireConfigAndTypes(options: { background?: boolean; forceReload?: boolean } = {}): Promise<LoadedSchema | null> {
+    const background = options.background ?? false;
+    const loaded = await this.getConfigAndTypes(options.forceReload ?? false);
+    if (!loaded) {
+      if (!background) {
+        new Notice("No mdbase.yaml found. Run 'mdbase: Initialize collection' first.");
+      }
       return null;
     }
 
-    const types = await loadTypeDefinitions(this.app.vault, config);
-    if (types.size === 0) {
-      new Notice(`No types found in ${config.settings.types_folder}`);
+    if (loaded.types.size === 0 && !background) {
+      new Notice(`No types found in ${loaded.config.settings.types_folder}`);
     }
 
-    return { config, types };
+    return loaded;
+  }
+
+  private onVaultModify(file: TFile): void {
+    if (this.isRuntimePolicyRelevantPath(file.path)) void this.refreshRuntimePolicy();
+    if (this.isSchemaRelevantPath(file.path)) {
+      this.invalidateSchemaCache();
+    }
+
+    if (!this.settings.validateOnSave) return;
+    if (file.extension !== "md") return;
+    this.scheduleSaveValidation(file);
+  }
+
+  private onVaultRename(file: TFile, oldPath: string): void {
+    if (this.isRuntimePolicyRelevantPath(oldPath) || this.isRuntimePolicyRelevantPath(file.path)) {
+      void this.refreshRuntimePolicy();
+    }
+    if (this.isSchemaRelevantPath(oldPath) || this.isSchemaRelevantPath(file.path)) {
+      this.invalidateSchemaCache();
+    }
+
+    if (file.extension !== "md") return;
+
+    this.clearPendingSaveValidation(oldPath);
+    this.moveFileIssues(oldPath, file.path);
+
+    if (this.settings.validateOnSave) {
+      this.scheduleSaveValidation(file);
+    }
+  }
+
+  private onVaultDelete(file: TFile): void {
+    if (this.isRuntimePolicyRelevantPath(file.path)) void this.refreshRuntimePolicy();
+    if (this.isSchemaRelevantPath(file.path)) {
+      this.invalidateSchemaCache();
+    }
+
+    if (file.extension !== "md") return;
+    this.clearPendingSaveValidation(file.path);
+    this.clearFileIssues(file.path);
+  }
+
+  private onVaultCreate(file: TFile): void {
+    if (this.isRuntimePolicyRelevantPath(file.path)) void this.refreshRuntimePolicy();
+    if (this.isSchemaRelevantPath(file.path)) {
+      this.invalidateSchemaCache();
+    }
+  }
+
+  private isRuntimePolicyRelevantPath(path: string): boolean {
+    const normalized = normalizePath(path);
+    return normalized === "mdbase.yaml" || normalized === this.runtimePolicyPath;
+  }
+
+  private async refreshRuntimePolicy(): Promise<void> {
+    const generation = ++this.runtimePolicyRefreshGeneration;
+    const config = await loadMdbaseConfig(this.app.vault);
+    const selected = await loadSelectedRuntimePolicy(this.app.vault, config);
+    if (generation !== this.runtimePolicyRefreshGeneration) return;
+    this.runtimePolicy = selected.policy;
+    this.runtimePolicyPath = selected.path;
+    this.runtimePolicyDiagnostics = selected.diagnostics;
+    for (const diagnostic of selected.diagnostics) {
+      console.warn(`[mdbase/runtime] ${diagnostic.code}: ${diagnostic.message}`);
+    }
   }
 
   private async validateFileAndStore(file: TFile, reason: "save" | "open" | "manual"): Promise<MdbaseIssue[]> {
-    const loaded = await this.requireConfigAndTypes();
-    if (!loaded) return [];
+    const loaded = await this.requireConfigAndTypes({ background: reason !== "manual" });
+    if (!loaded) {
+      if (reason !== "manual") {
+        this.clearFileIssues(file.path);
+      }
+      return [];
+    }
 
     const issues = await validateFile(this.app.vault, file, loaded.config, loaded.types);
     this.setFileIssues(file.path, issues);
@@ -675,6 +1146,8 @@ export default class MdbasePlugin extends Plugin {
 
   private async initializeCollectionCommand(): Promise<void> {
     const { created } = await ensureCollectionInitialized(this.app.vault);
+    this.invalidateSchemaCache();
+
     if (created.length === 0) {
       new Notice("mdbase collection already initialized.");
       return;
@@ -690,7 +1163,10 @@ export default class MdbasePlugin extends Plugin {
       return;
     }
 
-    const model = await new TypeEditorModal(this.app, createDefaultTypeModel(), "Create type definition").openAndGetValue();
+    const defaultModel = createDefaultTypeModel();
+    defaultModel.specProfile = config.spec_version.startsWith("0.3.") ? "v0.3" : "v0.2";
+    defaultModel.originalFrontmatter = {};
+    const model = await new TypeEditorModal(this.app, defaultModel, "Create type definition").openAndGetValue();
     if (!model) return;
 
     try {
@@ -846,11 +1322,10 @@ export default class MdbasePlugin extends Plugin {
   }
 
   async runCollectionValidation(showSummary: boolean): Promise<void> {
-    const loaded = await this.requireConfigAndTypes();
+    const loaded = await this.requireConfigAndTypes({ background: false });
     if (!loaded) return;
 
     const issues = await validateCollection(this.app.vault, loaded.config, loaded.types);
-
     const nextMap = new Map<string, MdbaseIssue[]>();
     for (const issue of issues) {
       const list = nextMap.get(issue.path) ?? [];
@@ -878,6 +1353,13 @@ export default class MdbasePlugin extends Plugin {
     const parsed = parseFrontmatter(raw);
     if (parsed.error) {
       new Notice(`Invalid type frontmatter: ${parsed.error}`);
+      return;
+    }
+    const schemaWrapper = parsed.frontmatter.schema && typeof parsed.frontmatter.schema === "object" && !Array.isArray(parsed.frontmatter.schema)
+      ? parsed.frontmatter.schema as Record<string, unknown>
+      : null;
+    if (parsed.frontmatter.kind === "mdbase.type" && typeof schemaWrapper?.ref === "string") {
+      new Notice("This type uses schema.ref. Edit the referenced JSON Schema file directly.");
       return;
     }
 
@@ -936,7 +1418,9 @@ export default class MdbasePlugin extends Plugin {
         throw new Error(`Type already exists: ${defaultTargetPath}`);
       }
 
-      return await this.app.vault.create(defaultTargetPath, content);
+      const created = await this.app.vault.create(defaultTargetPath, content);
+      this.invalidateSchemaCache();
+      return created;
     }
 
     const slashIndex = existingFile.path.lastIndexOf("/");
@@ -958,6 +1442,7 @@ export default class MdbasePlugin extends Plugin {
     }
 
     await this.app.vault.modify(updatedFile, content);
+    this.invalidateSchemaCache();
     return updatedFile;
   }
 }
