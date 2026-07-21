@@ -14,6 +14,13 @@ It works through Obsidian's Vault, HTTP, IndexedDB, and SecretStorage APIs. The
 production bundle has no Node filesystem dependency and is checked against a
 mobile bundle budget.
 
+Canonical view files remain ordinary v0.3 records in this adapter. When a
+collection materializes `_types/view.md` (normally referring to
+`schemas/v0.3/view.schema.json`), the plugin validates their nested shared
+`query` and named-view frontmatter like any other typed record. This plugin does
+not execute named views or advertise the optional `view_records` feature; it
+leaves execution and presentation to query-capable companion tools.
+
 ## Collection roles
 
 ### Local collection
