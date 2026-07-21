@@ -381,6 +381,49 @@ test("v0.3 validation uses canonical JSON Schema diagnostics on raw frontmatter"
   assert.ok(invalidIssues.some((issue) => issue.code === "schema_additional_properties" && issue.field === "extra"));
 });
 
+test("v0.3 view query scope stays nested and the view validates as an ordinary record", async () => {
+  const vault = new MockVault();
+  await vault.writeNote("_types/view.md", {
+    kind: "mdbase.type",
+    name: "view",
+    version: 1,
+    schema: {
+      dialect: "json-schema-2020-12",
+      value: {
+        type: "object",
+        required: ["type", "id", "version", "name", "views"],
+        additionalProperties: false,
+        properties: {
+          type: { const: "view" },
+          id: { type: "string" },
+          version: { type: "integer", minimum: 1 },
+          name: { type: "string" },
+          query: {
+            type: "object",
+            properties: { types: { type: "array", items: { type: "string" } } },
+            additionalProperties: false,
+          },
+          views: { type: "array", minItems: 1, items: { type: "object" } },
+        },
+      },
+    },
+  });
+  const file = await vault.writeNote("views/tasks.md", {
+    type: "view",
+    id: "tasks.views",
+    version: 1,
+    name: "Task views",
+    query: { types: ["task"] },
+    views: [{ id: "all", name: "All tasks" }],
+  });
+  const config = createV03Config();
+  const types = await loadTypeDefinitions(vault as unknown as any, config);
+  const parsed = parseFrontmatter(await vault.cachedRead(file));
+
+  assert.deepEqual(getTypesForFile(file.path, parsed.frontmatter, config, types), ["view"]);
+  assert.deepEqual(await validateFile(vault as unknown as any, file, config, types), []);
+});
+
 test("v0.3 collection validation enforces links and unique rules", async () => {
   const vault = new MockVault();
   await vault.writeNote("_types/task.md", v03TaskType());

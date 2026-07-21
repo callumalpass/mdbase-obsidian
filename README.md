@@ -19,6 +19,13 @@ default, uniqueness, link, and path metadata. The type editor writes inline
 extension sections. Types using `schema.ref` validate normally but are
 read-only in the form; edit their referenced JSON Schema file directly.
 
+Canonical view files remain ordinary v0.3 records in this adapter. When a
+collection materializes `_types/view.md` (normally referring to
+`schemas/v0.3/view.schema.json`), the plugin validates their nested shared
+`query` and named-view frontmatter like any other typed record. This plugin does
+not execute named views or advertise the optional `view_records` feature; it
+leaves execution and presentation to query-capable companion tools.
+
 The runtime host is available to companion plugins through
 `app.plugins.getPlugin("mdbase-obsidian")?.api.runtime`. It is generic and
 default-deny; TaskNotes is an optional provider rather than the host owner.
