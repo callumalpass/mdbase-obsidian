@@ -1451,7 +1451,7 @@ function resolveStrictMode(typeDefs: MdbaseTypeDef[], config: MdbaseConfig): Str
   return config.settings.default_strict ? "warn" : false;
 }
 
-function isExcluded(path: string, config: MdbaseConfig): boolean {
+export function isExcluded(path: string, config: MdbaseConfig): boolean {
   const normalizedPath = normalizePath(path);
   const typesFolder = normalizePath(config.settings.types_folder);
   if (normalizedPath.startsWith(`${typesFolder}/`) || normalizedPath === typesFolder) return true;
