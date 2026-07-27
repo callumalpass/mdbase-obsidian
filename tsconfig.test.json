@@ -1,7 +1,8 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "module": "CommonJS",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
     "target": "ES2020",
     "esModuleInterop": true,
     "outDir": ".test-dist",
@@ -18,7 +19,11 @@
     ]
   },
   "include": [
+    "src/connectSync.ts",
     "src/mdbaseCore.ts",
+    "src/migration.ts",
+    "src/typeModel.ts",
+    "src/typeEditorTypes.ts",
     "test/**/*.ts"
   ]
 }

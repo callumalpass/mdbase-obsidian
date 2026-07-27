@@ -1,0 +1,11 @@
+{
+  "fixture": "test vault, approximately 7500 Markdown files",
+  "captured": "2026-07-27",
+  "maximums": {
+    "schema_ms": 250,
+    "migration_ms": 2500,
+    "validation_ms": 6500,
+    "issues_render_ms": 750,
+    "rendered_issue_rows": 250
+  }
+}

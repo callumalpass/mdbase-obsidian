@@ -1,14 +1,17 @@
 {
   "name": "mdbase-obsidian",
-  "version": "0.1.0",
-  "description": "Obsidian plugin for mdbase schema management and validation",
+  "version": "0.3.0",
+  "description": "The Obsidian gateway to mdbase types and mdbase Connect",
   "main": "main.js",
+  "type": "module",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "check:mobile": "npm run build && node scripts/check-mobile.mjs",
     "build:test": "npm run build && node copy-files.mjs",
+    "profile:testvault": "node scripts/profile-testvault.mjs",
     "test": "npm run test:unit",
-    "test:unit": "tsc -p tsconfig.test.json && node -r ./test/obsidian-shim.cjs --test .test-dist/test/**/*.test.js",
+    "test:unit": "tsc -p tsconfig.test.json && node --experimental-specifier-resolution=node --loader ./test/obsidian-loader.mjs --test .test-dist/test/**/*.test.js",
     "copy-files": "node copy-files.mjs",
     "version": "node version-bump.mjs && git add manifest.json versions.json"
   },
@@ -30,6 +33,8 @@
   },
   "dependencies": {
     "@callumalpass/mdbase-runtime": "0.1.0-rc.1",
+    "@mdbase/connect-protocol": "file:vendor/mdbase-connect-protocol-0.1.0-beta.8-7cc5f84dd657.tgz",
+    "@mdbase/connect-sync": "file:vendor/mdbase-connect-sync-0.1.0-beta.8-7cc5f84dd657.tgz",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "picomatch": "^4.0.5"

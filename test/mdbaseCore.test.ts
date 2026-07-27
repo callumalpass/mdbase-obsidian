@@ -10,6 +10,7 @@ import {
   buildUniqueNotePath,
   ensureCollectionInitialized,
   fieldsFromV03Schema,
+  formatMarkdown,
   getTypesForFile,
   loadMdbaseConfig,
   loadTypeDefinitions,
@@ -369,6 +370,7 @@ test("v0.3 validation uses canonical JSON Schema diagnostics on raw frontmatter"
     due: "16/07/2026",
     extra: true,
   });
+  const bodyOnly = await vault.create("tasks/body-only.md", "# Body-only task\n");
   const config = createV03Config();
   const types = await loadTypeDefinitions(vault as unknown as any, config);
 
@@ -379,6 +381,26 @@ test("v0.3 validation uses canonical JSON Schema diagnostics on raw frontmatter"
   const invalidIssues = await validateFile(vault as unknown as any, invalid, config, types);
   assert.ok(invalidIssues.some((issue) => issue.code === "format_invalid" && issue.field === "due"));
   assert.ok(invalidIssues.some((issue) => issue.code === "schema_additional_properties" && issue.field === "extra"));
+
+  const bodyOnlyIssues = await validateFile(vault as unknown as any, bodyOnly, config, types);
+  assert.ok(bodyOnlyIssues.some((issue) => issue.code === "schema_required" && issue.field === "type"));
+  assert.ok(!bodyOnlyIssues.some((issue) => issue.code === "missing_frontmatter"));
+  assert.ok(!bodyOnlyIssues.some((issue) => issue.code === "no_matching_type"));
+  assert.deepEqual(parseFrontmatter(await vault.cachedRead(bodyOnly)), {
+    hasFrontmatter: false,
+    frontmatter: {},
+    body: "# Body-only task\n",
+  });
+  assert.deepEqual(parseFrontmatter("---\n---\nExplicitly empty\n"), {
+    hasFrontmatter: true,
+    frontmatter: {},
+    body: "Explicitly empty\n",
+  });
+  assert.equal(
+    parseFrontmatter("---\nnull\n---\nNot an object\n").error,
+    "Frontmatter must be a YAML object",
+  );
+  assert.equal(formatMarkdown({}, "# Body-only task\n"), "# Body-only task\n");
 });
 
 test("v0.3 view query scope stays nested and the view validates as an ordinary record", async () => {

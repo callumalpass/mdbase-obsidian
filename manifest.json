@@ -1,9 +1,9 @@
 {
   "id": "mdbase-obsidian",
   "name": "mdbase",
-  "version": "0.1.0",
-  "minAppVersion": "1.5.0",
-  "description": "Schema, type, and validation tools for mdbase collections in Obsidian.",
+  "version": "0.3.0",
+  "minAppVersion": "1.11.4",
+  "description": "Edit mdbase types and mirror hosted collections through mdbase Connect.",
   "author": "calluma",
   "authorUrl": "https://github.com/callumalpass"
 }

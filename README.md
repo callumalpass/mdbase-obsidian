@@ -1,51 +1,114 @@
-# mdbase-obsidian
+# mdbase for Obsidian
 
-Obsidian plugin for mdbase schema workflows:
+The Obsidian gateway to mdbase v0.3 collections and mdbase Connect.
 
-- Initialize `mdbase.yaml` and `_types/`
-- Create basic type definition files
-- Validate current note and whole collection
-- Create note from type
-- Show issues in a dedicated view
-- Expose the selected Obsidian mdbase runtime host for independent providers
-  and workflow executors
+The plugin is deliberately type-first. Its main workspace provides:
 
-New collections initialize as `0.3.0`; existing v0.2 collections keep
-the legacy adapter. The Vault-backed v0.3 adapter loads canonical
-`mdbase.type` wrappers, validates raw frontmatter with JSON Schema 2020-12,
-asserts the required date/time formats, and applies collection display, read
-default, uniqueness, link, and path metadata. The type editor writes inline
-`schema.value` wrappers without discarding lifecycle/runtime/migration or
-extension sections. Types using `schema.ref` validate normally but are
-read-only in the form; edit their referenced JSON Schema file directly.
+- a searchable type workbench with guided and YAML editing;
+- local collection initialization;
+- read-only support for mdbase v0.2.x and reviewed migration to v0.3.x;
+- hosted collection enrollment, sync preview, mirroring, progress, and conflict handling;
+- collection validation with bounded issue rendering for large vaults.
 
-Canonical view files remain ordinary v0.3 records in this adapter. When a
-collection materializes `_types/view.md` (normally referring to
-`schemas/v0.3/view.schema.json`), the plugin validates their nested shared
-`query` and named-view frontmatter like any other typed record. This plugin does
-not execute named views or advertise the optional `view_records` feature; it
-leaves execution and presentation to query-capable companion tools.
+It works through Obsidian's Vault, HTTP, IndexedDB, and SecretStorage APIs. The
+production bundle has no Node filesystem dependency and is checked against a
+mobile bundle budget.
 
-The runtime host is available to companion plugins through
-`app.plugins.getPlugin("mdbase-obsidian")?.api.runtime`. It is generic and
-default-deny; TaskNotes is an optional provider rather than the host owner.
-For v0.3 collections, the adapter validates and loads the `runtime.policy`
-Markdown record selected by `mdbase.yaml`, refreshes it after vault edits, and
-keeps the existing provider registrations. Invalid, missing, disabled, or
-out-of-vault policies fail closed. `api.getRuntimeStatus()` exposes the selected
-policy ID, path, and adapter diagnostics.
+## Collection roles
 
-## Build
+### Local collection
+
+`Initialize this vault` creates a canonical v0.3 `mdbase.yaml` and `_types/`
+directory. The vault is authoritative and remains an ordinary collection of
+files.
+
+### Hosted mirror
+
+`Connect a hosted collection` enrolls the vault through mdbase Connect. The
+portable directory-mirror engine syncs hosted resources and records into the
+vault. A mirror role marker is stored below `.mdbase/`; credentials are stored
+only in Obsidian SecretStorage.
+
+The plugin refuses to enroll a directory that contains local collection
+authority metadata. Sync is explicit, preflighted, protected by an in-process
+lease, and conservative around conflicts.
+
+## Type workbench
+
+Open **mdbase: Open workspace** and choose **Types**.
+
+- Design mode edits identity, membership, placement, and recursive field
+  schemas—including nested objects, lists, lists of objects, enums, and links.
+- YAML mode exposes the canonical type definition.
+- Unknown v0.3 schema and extension data is preserved by guided edits.
+- Dirty changes and validation failures are shown before save.
+- v0.2 definitions are browsable but read-only until migration.
+
+On mobile, the type list and editor use separate navigation states with
+touch-sized actions instead of a compressed desktop split view.
+
+## Migrating v0.2 to v0.3
+
+The migration review shows the source and target versions, every planned write,
+warnings, lossy diagnostics, record-equivalence results, and the recovery
+location.
+
+Migration:
+
+- verifies that source files have not changed since analysis;
+- requires explicit consent for any lossy conversion;
+- writes backups and a recovery manifest below `.mdbase/migrations/`;
+- writes configuration and type definitions sequentially and rolls back on
+  failure;
+- verifies the result;
+- never rewrites records.
+
+Existing v0.3 collections are not offered migration.
+
+## Runtime integration
+
+Companion plugins can access the selected mdbase runtime host through:
+
+```ts
+app.plugins.getPlugin("mdbase-obsidian")?.api.runtime
+```
+
+The host remains default-deny. In v0.3 collections it validates and loads the
+selected `runtime.policy` record and fails closed for missing, invalid,
+disabled, or out-of-vault policies.
+
+## Development
 
 ```bash
 npm install
+npm test
 npm run build
 ```
 
-## Build and copy to test vault
+Additional gates:
 
 ```bash
+npm run check:mobile
+npm run profile:testvault
 npm run build:test
 ```
 
-`build:test` uses `copy-files.mjs` with the same override strategy as TaskNotes.
+`build:test` copies the built plugin to the configured test vaults.
+`profile:testvault` scans `/home/calluma/testvault/test` without writing it and
+enforces checked-in schema, migration-analysis, validation, and issue-render
+budgets.
+
+The Connect SDK packages are vendored as exact consumer tarballs. Their source
+revision and integrity hashes are recorded in
+`vendor/mdbase-connect-sdk.json`; regenerate them with the Connect repository's
+`package:consumer` script rather than editing the archives.
+
+## Compatibility
+
+- Authoring target: mdbase v0.3.x
+- Read and migration input: mdbase v0.2.x
+- Obsidian minimum version: 1.11.4
+- Desktop and mobile supported
+
+The plugin is not a general record editor, query dashboard, or Connect server
+administration client.
