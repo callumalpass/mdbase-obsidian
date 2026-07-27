@@ -28,12 +28,26 @@ class TFile {
   }
 }
 
+class TFolder {
+  constructor(path) {
+    this.path = normalizePath(path);
+    const segments = this.path.split("/");
+    this.name = segments[segments.length - 1] || "";
+  }
+}
+
 class Vault {}
+
+async function requestUrl() {
+  throw new Error("requestUrl is not configured in this unit test.");
+}
 
 module.exports = {
   normalizePath,
   parseYaml,
   stringifyYaml,
   TFile,
+  TFolder,
   Vault,
+  requestUrl,
 };

@@ -274,7 +274,7 @@ function linkExistsInVault(vault: Vault, filePath: string, rawReference: string)
 }
 
 export function parseFrontmatter(content: string): FrontmatterParse {
-  const frontmatterMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  const frontmatterMatch = content.match(/^---[ \t]*\r?\n([\s\S]*?)^---[ \t]*(?:\r?\n|$)/m);
   if (!frontmatterMatch) {
     return {
       hasFrontmatter: false,
@@ -284,7 +284,16 @@ export function parseFrontmatter(content: string): FrontmatterParse {
   }
 
   try {
-    const parsed = parseYaml(frontmatterMatch[1]);
+    const yamlSource = frontmatterMatch[1];
+    const parsed = parseYaml(yamlSource);
+    if (parsed == null && yamlSource.trim() !== "") {
+      return {
+        hasFrontmatter: true,
+        frontmatter: {},
+        body: content.slice(frontmatterMatch[0].length),
+        error: "Frontmatter must be a YAML object",
+      };
+    }
     if (parsed != null && !isRecord(parsed)) {
       return {
         hasFrontmatter: true,
@@ -310,6 +319,7 @@ export function parseFrontmatter(content: string): FrontmatterParse {
 }
 
 export function formatMarkdown(frontmatter: Record<string, unknown>, body = ""): string {
+  if (Object.keys(frontmatter).length === 0) return body;
   const yaml = stringifyYaml(frontmatter).trimEnd();
   const normalizedBody = body.replace(/^\n+/, "");
   return `---\n${yaml}\n---\n\n${normalizedBody}`;
@@ -460,42 +470,84 @@ function fieldDefinitionToSchema(
 ): Record<string, unknown> {
   const schema = { ...deepClone(existing) };
   const typeName = field.type ?? "string";
+  const clearObjectShape = (): void => {
+    delete schema.properties;
+    delete schema.required;
+    delete schema.additionalProperties;
+  };
+  const clearArrayShape = (): void => {
+    delete schema.items;
+  };
   if (typeName === "enum") {
     delete schema.type;
     schema.enum = deepClone(field.values ?? []);
+    delete schema.format;
+    clearObjectShape();
+    clearArrayShape();
   } else if (typeName === "list") {
     schema.type = "array";
+    delete schema.enum;
+    delete schema.format;
+    clearObjectShape();
     schema.items = fieldDefinitionToSchema(field.items ?? { type: "any" }, isRecord(schema.items) ? schema.items : {});
   } else if (typeName === "object") {
     schema.type = "object";
+    delete schema.enum;
+    delete schema.format;
+    clearArrayShape();
     const nested = schemaFromV03Fields(field.fields ?? {}, isRecord(schema) ? schema : {}, false);
     schema.properties = nested.properties;
     if (nested.required) schema.required = nested.required;
     else delete schema.required;
+  } else if (typeName === "link") {
+    schema.type = "string";
+    delete schema.enum;
+    delete schema.format;
+    clearObjectShape();
+    clearArrayShape();
   } else if (["date", "datetime", "time"].includes(typeName)) {
     schema.type = "string";
     schema.format = typeName === "datetime" ? "date-time" : typeName;
+    delete schema.enum;
+    clearObjectShape();
+    clearArrayShape();
   } else if (["string", "integer", "number", "boolean"].includes(typeName)) {
     schema.type = typeName;
     delete schema.format;
     delete schema.enum;
+    clearObjectShape();
+    clearArrayShape();
   } else {
     delete schema.type;
+    delete schema.enum;
+    delete schema.format;
+    clearObjectShape();
+    clearArrayShape();
   }
 
   if (field.default !== undefined) schema.default = deepClone(field.default);
   else delete schema.default;
-  if (typeof field.min === "number") schema.minimum = field.min;
+  if (typeof field.description === "string" && field.description.trim()) {
+    schema.description = field.description;
+  } else {
+    delete schema.description;
+  }
+  const supportsNumericBounds = typeName === "integer" || typeName === "number";
+  if (supportsNumericBounds && typeof field.min === "number") schema.minimum = field.min;
   else delete schema.minimum;
-  if (typeof field.max === "number") schema.maximum = field.max;
+  if (supportsNumericBounds && typeof field.max === "number") schema.maximum = field.max;
   else delete schema.maximum;
-  if (typeof field.min_length === "number") {
-    schema[typeName === "list" ? "minItems" : "minLength"] = field.min_length;
-  }
-  if (typeof field.max_length === "number") {
-    schema[typeName === "list" ? "maxItems" : "maxLength"] = field.max_length;
-  }
-  if (typeof field.pattern === "string") schema.pattern = field.pattern;
+
+  const supportsStringBounds = ["string", "link", "date", "datetime", "time"].includes(typeName);
+  if (typeName === "list" && typeof field.min_length === "number") schema.minItems = field.min_length;
+  else delete schema.minItems;
+  if (typeName === "list" && typeof field.max_length === "number") schema.maxItems = field.max_length;
+  else delete schema.maxItems;
+  if (supportsStringBounds && typeof field.min_length === "number") schema.minLength = field.min_length;
+  else delete schema.minLength;
+  if (supportsStringBounds && typeof field.max_length === "number") schema.maxLength = field.max_length;
+  else delete schema.maxLength;
+  if (supportsStringBounds && typeof field.pattern === "string") schema.pattern = field.pattern;
   else delete schema.pattern;
   return schema;
 }
@@ -506,19 +558,21 @@ export function schemaFromV03Fields(
   strict = false,
 ): Record<string, unknown> {
   const existingProperties = isRecord(existing.properties) ? existing.properties : {};
-  const properties: Record<string, unknown> = {};
+  const properties: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   const required: string[] = [];
   for (const [name, field] of Object.entries(fields)) {
     properties[name] = fieldDefinitionToSchema(field, isRecord(existingProperties[name]) ? existingProperties[name] : {});
     if (field.required === true) required.push(name);
   }
-  return {
+  const schema: Record<string, unknown> = {
     ...deepClone(existing),
     type: "object",
     properties,
-    ...(required.length > 0 ? { required } : {}),
     additionalProperties: !strict,
   };
+  if (required.length > 0) schema.required = required;
+  else delete schema.required;
+  return schema;
 }
 
 function resolveJsonPointer(document: unknown, pointer: string): unknown {
@@ -736,9 +790,130 @@ export function resolveFilenameForType(typeDef: MdbaseTypeDef, frontmatter: Reco
   return `${slugify(fallbackSource)}.md`;
 }
 
-function matchesSimpleWhere(where: Record<string, unknown>, frontmatter: Record<string, unknown>): boolean {
-  for (const [field, expected] of Object.entries(where)) {
-    if (frontmatter[field] !== expected) return false;
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function getWhereField(
+  frontmatter: Record<string, unknown>,
+  path: string,
+): { present: boolean; value: unknown } {
+  let current: unknown[] = [frontmatter];
+  for (const segment of path.split(".").filter(Boolean)) {
+    const expandArray = segment.endsWith("[]");
+    const key = expandArray ? segment.slice(0, -2) : segment;
+    const next: unknown[] = [];
+    for (const value of current) {
+      if (!isRecord(value) || !Object.prototype.hasOwnProperty.call(value, key)) continue;
+      const child = value[key];
+      if (expandArray && Array.isArray(child)) next.push(...child);
+      else if (!expandArray) next.push(child);
+    }
+    if (!next.length) return { present: false, value: undefined };
+    current = next;
+  }
+  return { present: true, value: current[0] };
+}
+
+function compareWhere(
+  left: unknown,
+  right: unknown,
+  predicate: (left: number | string, right: number | string) => boolean,
+): boolean {
+  if (typeof left === "number" && typeof right === "number" && Number.isFinite(left) && Number.isFinite(right)) {
+    return predicate(left, right);
+  }
+  return typeof left === "string" && typeof right === "string" && predicate(left, right);
+}
+
+function matchesWhereOperator(
+  selected: { present: boolean; value: unknown },
+  operator: string,
+  expected: unknown,
+  specVersion: string,
+): boolean {
+  const equals = (left: unknown, right: unknown) => canonicalJson(left) === canonicalJson(right);
+  switch (operator) {
+    case "eq":
+    case "const":
+      return selected.present && selected.value != null && equals(selected.value, expected);
+    case "neq":
+      return selected.present && selected.value != null && !equals(selected.value, expected);
+    case "gt":
+      return compareWhere(selected.value, expected, (left, right) => left > right);
+    case "gte":
+      return compareWhere(selected.value, expected, (left, right) => left >= right);
+    case "lt":
+      return compareWhere(selected.value, expected, (left, right) => left < right);
+    case "lte":
+      return compareWhere(selected.value, expected, (left, right) => left <= right);
+    case "exists":
+      return specVersion.startsWith("0.3.")
+        ? expected === true ? selected.present : !selected.present
+        : expected === true
+          ? selected.present && selected.value != null
+          : !selected.present || selected.value == null;
+    case "contains":
+      return Array.isArray(selected.value)
+        ? selected.value.some((entry) => equals(entry, expected))
+        : typeof selected.value === "string" && selected.value.includes(String(expected));
+    case "containsAll":
+      if (!Array.isArray(selected.value) || !Array.isArray(expected)) return false;
+      return expected.every((wanted) => (selected.value as unknown[]).some((entry) => equals(entry, wanted)));
+    case "containsAny":
+      if (!Array.isArray(selected.value) || !Array.isArray(expected)) return false;
+      return expected.some((wanted) => (selected.value as unknown[]).some((entry) => equals(entry, wanted)));
+    case "in":
+      return selected.value != null && Array.isArray(expected)
+        && expected.some((entry) => equals(entry, selected.value));
+    case "startsWith":
+    case "starts_with":
+      return typeof selected.value === "string" && selected.value.startsWith(String(expected));
+    case "endsWith":
+    case "ends_with":
+      return typeof selected.value === "string" && selected.value.endsWith(String(expected));
+    case "matches":
+      try {
+        return selected.value != null && new RegExp(String(expected).replace(/\\\\/g, "\\")).test(String(selected.value));
+      } catch {
+        return false;
+      }
+    default:
+      return false;
+  }
+}
+
+function matchesStructuredWhere(
+  where: Record<string, unknown>,
+  frontmatter: Record<string, unknown>,
+  specVersion: string,
+): boolean {
+  if ("and" in where) {
+    return Array.isArray(where.and)
+      && where.and.every((condition) => isRecord(condition)
+        && matchesStructuredWhere(condition, frontmatter, specVersion));
+  }
+  if ("or" in where) {
+    return Array.isArray(where.or)
+      && where.or.some((condition) => isRecord(condition)
+        && matchesStructuredWhere(condition, frontmatter, specVersion));
+  }
+  if ("not" in where) {
+    return isRecord(where.not) && !matchesStructuredWhere(where.not, frontmatter, specVersion);
+  }
+  for (const [field, condition] of Object.entries(where)) {
+    const selected = getWhereField(frontmatter, field);
+    if (!isRecord(condition)) {
+      if (!selected.present || canonicalJson(selected.value) !== canonicalJson(condition)) return false;
+      continue;
+    }
+    for (const [operator, expected] of Object.entries(condition)) {
+      if (!matchesWhereOperator(selected, operator, expected, specVersion)) return false;
+    }
   }
   return true;
 }
@@ -774,7 +949,7 @@ export function getTypesForFile(
     }
 
     if (isMatch && isRecord(match.where)) {
-      isMatch = matchesSimpleWhere(match.where, frontmatter);
+      isMatch = matchesStructuredWhere(match.where, frontmatter, config.spec_version);
     }
 
     if (isMatch && typeof match.where === "string") {
@@ -1312,10 +1487,6 @@ export async function validateFile(
   if (parsed.error) {
     pushIssue(issues, file.path, "error", "invalid_frontmatter", parsed.error);
     return issues;
-  }
-
-  if (!parsed.hasFrontmatter) {
-    pushIssue(issues, file.path, "warn", "missing_frontmatter", "File has no YAML frontmatter");
   }
 
   const frontmatter = parsed.frontmatter;
