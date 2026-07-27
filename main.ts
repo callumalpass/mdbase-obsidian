@@ -510,6 +510,7 @@ export default class MdbasePlugin extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    await this.connectSync.initialize();
     await this.refreshRuntimePolicy();
     addIcon(MDBASE_ICON_ID, MDBASE_ICON_SVG);
 
@@ -673,6 +674,7 @@ export default class MdbasePlugin extends Plugin {
   }
 
   async saveTypeModel(model: TypeEditorModel, existingPath: string | null): Promise<TFile> {
+    this.connectSync.assertLocalAuthorityWritable();
     if (this.getMirrorProfile()?.mode === "read_only") {
       throw new Error("This mirror has read-only access. Re-enroll it with write access before editing types.");
     }
@@ -693,6 +695,7 @@ export default class MdbasePlugin extends Plugin {
   }
 
   async initializeCollection(): Promise<void> {
+    this.connectSync.assertLocalAuthorityWritable();
     await this.initializeCollectionCommand();
     this.refreshWorkspaceViews(true);
   }
@@ -709,6 +712,7 @@ export default class MdbasePlugin extends Plugin {
   }
 
   async applyMigration(plan: V02MigrationPlan, allowLossy: boolean): Promise<void> {
+    this.connectSync.assertLocalAuthorityWritable();
     if (this.getMirrorProfile()) {
       throw new Error("Collection authority resources must be migrated at the collection authority.");
     }
@@ -737,6 +741,7 @@ export default class MdbasePlugin extends Plugin {
   }
 
   async applyQuickFix(issue: MdbaseIssue): Promise<void> {
+    this.connectSync.assertLocalAuthorityWritable();
     const file = this.app.vault.getAbstractFileByPath(issue.path);
     if (!(file instanceof TFile)) {
       new Notice(`File not found: ${issue.path}`);
@@ -1092,6 +1097,7 @@ export default class MdbasePlugin extends Plugin {
   }
 
   private async initializeCollectionCommand(): Promise<void> {
+    this.connectSync.assertLocalAuthorityWritable();
     if (this.getMirrorProfile()) {
       new Notice("This vault is configured as a mirror. Sync it instead of initializing a local collection.");
       return;
@@ -1129,6 +1135,7 @@ export default class MdbasePlugin extends Plugin {
   }
 
   private async createNoteFromTypeCommand(): Promise<void> {
+    this.connectSync.assertLocalAuthorityWritable();
     const loaded = await this.requireConfigAndTypes();
     if (!loaded) return;
 

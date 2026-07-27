@@ -7,6 +7,7 @@ import {
   WorkspaceLeaf,
 } from "obsidian";
 import type { MirrorInitializationPreview, MirrorProgress, MirrorStatus } from "@mdbase/connect-sync/mirror";
+import type { AuthorityAdoptionStatus } from "@mdbase/connect-sync/adoption";
 import type {
   ConnectSyncController,
   MirrorProfile,
@@ -901,6 +902,10 @@ export class MdbaseWorkspaceView extends ItemView {
   }
 
   private renderEnrollment(container: HTMLElement): void {
+    if (this.schema || this.host.connectSync.getAdoptionMarker()) {
+      this.renderLocalAdoption(container);
+      return;
+    }
     const section = container.createEl("section", { cls: "mdbase-editor-section mdbase-enrollment" });
     section.createEl("h3", { text: "Connect collection authority" });
     section.createEl("p", {
@@ -974,6 +979,99 @@ export class MdbaseWorkspaceView extends ItemView {
         if (this.enrollmentAbort === abort) this.enrollmentAbort = null;
       }
     });
+  }
+
+  private renderLocalAdoption(container: HTMLElement): void {
+    const checkpoint = this.host.connectSync.getAdoptionMarker();
+    const section = container.createEl("section", { cls: "mdbase-editor-section mdbase-enrollment" });
+    section.createEl("h3", { text: "Host this local collection" });
+    section.createEl("p", {
+      text: checkpoint
+        ? "This vault has a durable adoption checkpoint. Resume it without creating another hosted collection."
+        : "Hosted mdbase will adopt an exact snapshot and become the collection authority. This vault will then continue as a read-write mirror.",
+    });
+    const verificationUri = this.enrollmentVerification || checkpoint?.session.verificationUri;
+    if (verificationUri) {
+      const approval = section.createDiv({ cls: "mdbase-approval-link" });
+      approval.createSpan({ text: "Approval page: " });
+      const link = approval.createEl("a", { text: "Open Connect", href: verificationUri });
+      link.setAttr("target", "_blank");
+      link.setAttr("rel", "noopener noreferrer");
+    }
+    let controlUrl = checkpoint?.session.controlUrl ?? "https://connect.mdbase.dev";
+    let mirrorName = checkpoint?.session.requested.mirrorName ?? "Obsidian";
+    if (!checkpoint) {
+      inputRow(section, "Connect URL", controlUrl, (value) => {
+        controlUrl = value;
+      }, { placeholder: "https://connect.mdbase.dev" });
+      inputRow(section, "Mirror name", mirrorName, (value) => {
+        mirrorName = value;
+      });
+    } else {
+      const values = section.createDiv({ cls: "mdbase-status-list" });
+      renderStatus(values, "Collection", checkpoint.session.requested.collectionId);
+      renderStatus(values, "Phase", checkpoint.phase.replace(/_/g, " "));
+      renderStatus(values, "Connect", checkpoint.session.controlUrl);
+    }
+    const warning = section.createDiv({ cls: "mdbase-inline-message" });
+    warning.createEl("strong", { text: "Authority cut-over: " });
+    warning.appendText(
+      "once final staging begins, plugin-managed local edits pause until hosted activation is confirmed. The checkpoint survives app restarts and uncertain network responses.",
+    );
+    const button = section.createEl("button", {
+      text: checkpoint ? "Resume adoption" : "Approve and host collection",
+    });
+    button.addClass("mod-cta");
+    button.disabled = this.busy;
+    button.onclick = () => void this.perform(async () => {
+      this.enrollmentAbort?.abort();
+      const abort = new AbortController();
+      this.enrollmentAbort = abort;
+      const onVerification = (verification: { verificationUri: string }) => {
+        this.enrollmentVerification = verification.verificationUri;
+        this.transientMessage = "Approve the authority move in Connect, then return here. This checkpoint is safe to resume.";
+        this.render();
+      };
+      const onStatus = (status: AuthorityAdoptionStatus) => {
+        this.transientMessage = status.state === "waiting_for_approval"
+          ? "Waiting for authority-move approval in Connect…"
+          : `Connect is retrying (attempt ${status.attempt}).`;
+        this.render();
+      };
+      try {
+        if (checkpoint) {
+          await this.host.connectSync.resumeAdoption({
+            signal: abort.signal,
+            onVerification,
+            onStatus,
+          });
+        } else {
+          await this.host.connectSync.adoptLocalCollection({
+            controlUrl,
+            mirrorName,
+          }, {
+            signal: abort.signal,
+            onVerification,
+            onStatus,
+          });
+        }
+        this.enrollmentVerification = "";
+        this.transientMessage = "Hosted mdbase is authoritative and this vault is now its read-write mirror.";
+        await this.refresh(true);
+      } finally {
+        if (this.enrollmentAbort === abort) this.enrollmentAbort = null;
+      }
+    });
+    if (checkpoint && !["activating", "adopted"].includes(checkpoint.phase)) {
+      const cancel = section.createEl("button", { text: "Cancel adoption" });
+      cancel.disabled = this.busy;
+      cancel.onclick = () => void this.perform(async () => {
+        await this.host.connectSync.cancelAdoption();
+        this.enrollmentVerification = "";
+        this.transientMessage = "Collection adoption cancelled. This vault remains the local authority.";
+        await this.refresh(true);
+      });
+    }
   }
 
   private renderMirrorPreview(container: HTMLElement, preview: MirrorInitializationPreview): void {
