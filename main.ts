@@ -20,6 +20,10 @@ import {
   type MdbaseRuntimePolicyInfo,
 } from "@callumalpass/mdbase-runtime";
 import {
+  ObsidianInteropBridge,
+  type MdbaseObsidianInteropApi,
+} from "./src/interopBridge";
+import {
   MdbaseConfig,
   MdbaseIssue,
   MdbaseTypeDef,
@@ -68,6 +72,7 @@ interface MdbasePluginSettings {
   validateOnSave: boolean;
   validateOnOpen: boolean;
   showNoticeOnSave: boolean;
+  interopEnabled: boolean;
   mirrorProfile: MirrorProfile | null;
 }
 
@@ -75,6 +80,7 @@ const DEFAULT_SETTINGS: MdbasePluginSettings = {
   validateOnSave: true,
   validateOnOpen: true,
   showNoticeOnSave: false,
+  interopEnabled: false,
   mirrorProfile: null,
 };
 
@@ -451,6 +457,19 @@ class MdbaseSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }),
       );
+
+    new Setting(containerEl)
+      .setName("Allow local application interoperability")
+      .setDesc(
+        "Allow installed Obsidian plugins to exchange validated mdbase events and actions in this vault. "
+        + "Contracts establish compatibility; this switch is the separate user grant.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.interopEnabled).onChange(async (value) => {
+          this.plugin.settings.interopEnabled = value;
+          await this.plugin.saveSettings();
+        }),
+      );
   }
 }
 
@@ -462,10 +481,15 @@ interface LoadedSchema {
 export interface MdbaseObsidianApiV1 {
   readonly apiVersion: 1;
   readonly runtime: MdbaseRuntimeHostApi;
+  readonly interop: MdbaseObsidianInteropApi;
   getRuntimeStatus(): {
     policyId: string;
     policyPath?: string;
     diagnostics: RuntimePolicyDiagnostic[];
+  };
+  getInteropStatus(): {
+    enabled: boolean;
+    profileVersion: "0.1";
   };
 }
 
@@ -487,6 +511,7 @@ export default class MdbasePlugin extends Plugin {
   private runtimePolicyPath: string | undefined;
   private runtimePolicyDiagnostics: RuntimePolicyDiagnostic[] = [];
   private runtimePolicyRefreshGeneration = 0;
+  private readonly interopBridge: ObsidianInteropBridge;
 
   constructor(app: App, manifest: import("obsidian").PluginManifest) {
     super(app, manifest);
@@ -497,13 +522,19 @@ export default class MdbasePlugin extends Plugin {
         await this.saveSettings();
       },
     });
+    this.interopBridge = new ObsidianInteropBridge(app, () => this.settings?.interopEnabled === true);
     this.api = {
       apiVersion: 1,
       runtime: new InMemoryRuntimeHost({ policyResolver: () => this.runtimePolicy }),
+      interop: this.interopBridge,
       getRuntimeStatus: () => ({
         policyId: this.runtimePolicy.id,
         policyPath: this.runtimePolicyPath,
         diagnostics: this.runtimePolicyDiagnostics.map((diagnostic) => ({ ...diagnostic })),
+      }),
+      getInteropStatus: () => ({
+        enabled: this.settings?.interopEnabled === true,
+        profileVersion: "0.1",
       }),
     };
   }
@@ -631,6 +662,7 @@ export default class MdbasePlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    await this.interopBridge.dispose();
     await this.api.runtime.dispose();
     this.app.workspace.getLeavesOfType(MDBASE_WORKSPACE_VIEW).forEach((leaf) => leaf.detach());
     this.app.workspace.getLeavesOfType(MDBASE_ISSUES_VIEW).forEach((leaf) => leaf.detach());

@@ -77,6 +77,29 @@ The host remains default-deny. In v0.3 collections it validates and loads the
 selected `runtime.policy` record and fails closed for missing, invalid,
 disabled, or out-of-vault policies.
 
+## Application interoperability
+
+The plugin also hosts local application interoperability for companion plugins:
+
+```ts
+const host = app.plugins.getPlugin("mdbase-obsidian");
+const client = host?.api.interop.connect(yourPlugin);
+```
+
+Enable **Allow local application interoperability** in mdbase settings first.
+The grant is deliberately off by default and is independent of contract
+compatibility: matching schemas do not authorize an application.
+
+The bridge verifies each caller from Obsidian's active plugin registry. Event
+sources publish CloudEvents 1.0 envelopes to every compatible subscriber.
+Actions resolve to exactly one compatible provider; zero providers and
+ambiguous providers fail explicitly. Every delivered event and action outcome
+records the exact contract version and digest plus application and
+implementation identity.
+
+The bridge is cooperative, same-process transport for Obsidian plugins. It does
+not claim durable delivery or cross-device execution.
+
 ## Development
 
 ```bash
