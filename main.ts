@@ -14,12 +14,6 @@ import {
   normalizePath,
 } from "obsidian";
 import {
-  DEFAULT_DENY_RUNTIME_POLICY,
-  InMemoryRuntimeHost,
-  type MdbaseRuntimeHostApi,
-  type MdbaseRuntimePolicyInfo,
-} from "@callumalpass/mdbase-runtime";
-import {
   ObsidianInteropBridge,
   type MdbaseObsidianInteropApi,
 } from "./src/interopBridge";
@@ -42,10 +36,6 @@ import {
   validateFile,
 } from "./src/mdbaseCore";
 import type { TypeEditorModel } from "./src/typeEditorTypes";
-import {
-  loadSelectedRuntimePolicy,
-  type RuntimePolicyDiagnostic,
-} from "./src/runtimePolicy";
 import {
   ConnectSyncController,
   type MirrorProfile,
@@ -480,13 +470,7 @@ interface LoadedSchema {
 
 export interface MdbaseObsidianApiV1 {
   readonly apiVersion: 1;
-  readonly runtime: MdbaseRuntimeHostApi;
   readonly interop: MdbaseObsidianInteropApi;
-  getRuntimeStatus(): {
-    policyId: string;
-    policyPath?: string;
-    diagnostics: RuntimePolicyDiagnostic[];
-  };
   getInteropStatus(): {
     enabled: boolean;
     profileVersion: "0.1";
@@ -504,13 +488,6 @@ export default class MdbasePlugin extends Plugin {
   private schemaLoadPromise: Promise<LoadedSchema | null> | null = null;
   private pendingSaveValidations = new Map<string, number>();
   private readonly saveValidationDebounceMs = 250;
-  private runtimePolicy: MdbaseRuntimePolicyInfo = {
-    ...DEFAULT_DENY_RUNTIME_POLICY,
-    capabilities: { ...DEFAULT_DENY_RUNTIME_POLICY.capabilities },
-  };
-  private runtimePolicyPath: string | undefined;
-  private runtimePolicyDiagnostics: RuntimePolicyDiagnostic[] = [];
-  private runtimePolicyRefreshGeneration = 0;
   private readonly interopBridge: ObsidianInteropBridge;
 
   constructor(app: App, manifest: import("obsidian").PluginManifest) {
@@ -525,13 +502,7 @@ export default class MdbasePlugin extends Plugin {
     this.interopBridge = new ObsidianInteropBridge(app, () => this.settings?.interopEnabled === true);
     this.api = {
       apiVersion: 1,
-      runtime: new InMemoryRuntimeHost({ policyResolver: () => this.runtimePolicy }),
       interop: this.interopBridge,
-      getRuntimeStatus: () => ({
-        policyId: this.runtimePolicy.id,
-        policyPath: this.runtimePolicyPath,
-        diagnostics: this.runtimePolicyDiagnostics.map((diagnostic) => ({ ...diagnostic })),
-      }),
       getInteropStatus: () => ({
         enabled: this.settings?.interopEnabled === true,
         profileVersion: "0.1",
@@ -542,7 +513,6 @@ export default class MdbasePlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
     await this.connectSync.initialize();
-    await this.refreshRuntimePolicy();
     addIcon(MDBASE_ICON_ID, MDBASE_ICON_SVG);
 
     this.statusBarEl = this.addStatusBarItem();
@@ -663,7 +633,6 @@ export default class MdbasePlugin extends Plugin {
 
   async onunload(): Promise<void> {
     await this.interopBridge.dispose();
-    await this.api.runtime.dispose();
     this.app.workspace.getLeavesOfType(MDBASE_WORKSPACE_VIEW).forEach((leaf) => leaf.detach());
     this.app.workspace.getLeavesOfType(MDBASE_ISSUES_VIEW).forEach((leaf) => leaf.detach());
     this.clearAllPendingSaveValidations();
@@ -757,7 +726,6 @@ export default class MdbasePlugin extends Plugin {
       );
     }
     this.invalidateSchemaCache();
-    await this.refreshRuntimePolicy();
     new Notice(`Migrated to mdbase v0.3. Recovery manifest: ${result.manifestPath}`);
     this.refreshWorkspaceViews(true);
   }
@@ -1041,7 +1009,6 @@ export default class MdbasePlugin extends Plugin {
   }
 
   private onVaultModify(file: TFile): void {
-    if (this.isRuntimePolicyRelevantPath(file.path)) void this.refreshRuntimePolicy();
     if (this.isSchemaRelevantPath(file.path)) {
       this.invalidateSchemaCache();
       this.refreshWorkspaceViews();
@@ -1053,9 +1020,6 @@ export default class MdbasePlugin extends Plugin {
   }
 
   private onVaultRename(file: TFile, oldPath: string): void {
-    if (this.isRuntimePolicyRelevantPath(oldPath) || this.isRuntimePolicyRelevantPath(file.path)) {
-      void this.refreshRuntimePolicy();
-    }
     if (this.isSchemaRelevantPath(oldPath) || this.isSchemaRelevantPath(file.path)) {
       this.invalidateSchemaCache();
       this.refreshWorkspaceViews();
@@ -1072,7 +1036,6 @@ export default class MdbasePlugin extends Plugin {
   }
 
   private onVaultDelete(file: TFile): void {
-    if (this.isRuntimePolicyRelevantPath(file.path)) void this.refreshRuntimePolicy();
     if (this.isSchemaRelevantPath(file.path)) {
       this.invalidateSchemaCache();
       this.refreshWorkspaceViews();
@@ -1084,28 +1047,9 @@ export default class MdbasePlugin extends Plugin {
   }
 
   private onVaultCreate(file: TFile): void {
-    if (this.isRuntimePolicyRelevantPath(file.path)) void this.refreshRuntimePolicy();
     if (this.isSchemaRelevantPath(file.path)) {
       this.invalidateSchemaCache();
       this.refreshWorkspaceViews();
-    }
-  }
-
-  private isRuntimePolicyRelevantPath(path: string): boolean {
-    const normalized = normalizePath(path);
-    return normalized === "mdbase.yaml" || normalized === this.runtimePolicyPath;
-  }
-
-  private async refreshRuntimePolicy(): Promise<void> {
-    const generation = ++this.runtimePolicyRefreshGeneration;
-    const config = await loadMdbaseConfig(this.app.vault);
-    const selected = await loadSelectedRuntimePolicy(this.app.vault, config);
-    if (generation !== this.runtimePolicyRefreshGeneration) return;
-    this.runtimePolicy = selected.policy;
-    this.runtimePolicyPath = selected.path;
-    this.runtimePolicyDiagnostics = selected.diagnostics;
-    for (const diagnostic of selected.diagnostics) {
-      console.warn(`[mdbase/runtime] ${diagnostic.code}: ${diagnostic.message}`);
     }
   }
 

@@ -65,18 +65,6 @@ Migration:
 
 Existing v0.3 collections are not offered migration.
 
-## Runtime integration
-
-Companion plugins can access the selected mdbase runtime host through:
-
-```ts
-app.plugins.getPlugin("mdbase-obsidian")?.api.runtime
-```
-
-The host remains default-deny. In v0.3 collections it validates and loads the
-selected `runtime.policy` record and fails closed for missing, invalid,
-disabled, or out-of-vault policies.
-
 ## Application interoperability
 
 The plugin also hosts local application interoperability for companion plugins:
@@ -98,7 +86,9 @@ records the exact contract version and digest plus application and
 implementation identity.
 
 The bridge is cooperative, same-process transport for Obsidian plugins. It does
-not claim durable delivery or cross-device execution.
+not claim to be a durable runtime: workflows, scheduling, retries, recovery,
+and runtime-policy admission belong to a Runtime 0.2 host such as Connect. It
+does not claim durable delivery or cross-device execution.
 
 ## Development
 
