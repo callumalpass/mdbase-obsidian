@@ -57,7 +57,6 @@ import {
   isExcluded,
   loadMdbaseConfig,
   normalizeSafeRelativePath,
-  parseFrontmatter,
 } from "./mdbaseCore";
 
 export interface MirrorProfile {
@@ -642,8 +641,8 @@ export class ConnectSyncController {
       const prepared = marker.phase === "waiting_for_approval"
         ? await this.adoptionClient.waitForApproval(session, callbacks)
         : await this.requirePreparedAdoption(session, callbacks);
-      await this.updateAdoptionPhase("uploading");
       const warmSnapshot = await this.captureAuthoritySnapshot(session.requested.collectionId);
+      await this.updateAdoptionPhase("uploading");
       await this.adoptionClient.uploadSnapshot(session, prepared, warmSnapshot, callbacks);
 
       // From this point local plugin writes are stopped. Any external file edit is
@@ -784,13 +783,6 @@ export class ConnectSyncController {
       const path = normalizePath(file.path);
       if (isExcluded(path, config)) continue;
       const document = await this.app.vault.cachedRead(file);
-      const parsed = parseFrontmatter(document);
-      if (parsed.error) {
-        throw new SyncError(
-          "invalid_authority_record",
-          `${path} has invalid frontmatter: ${parsed.error}`,
-        );
-      }
       records.push({
         path,
         document,

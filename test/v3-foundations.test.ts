@@ -1,4 +1,5 @@
 import * as assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { test } from "node:test";
 import { normalizePath, TFile, TFolder } from "obsidian";
@@ -39,6 +40,10 @@ interface StoredFile {
 
 const TestFile = TFile as unknown as { new (path: string): TFile };
 const TestFolder = TFolder as unknown as { new (path: string): TFolder };
+
+function sha256Revision(document: string): string {
+  return `sha256:${createHash("sha256").update(document).digest("hex")}`;
+}
 
 class MemoryVault {
   readonly files = new Map<string, StoredFile>();
@@ -745,6 +750,8 @@ test("device lease rejects concurrent mirror ownership and releases after failur
 });
 
 test("portable mirror materializes resources and records through Obsidian Vault APIs", async () => {
+  const configuration = "spec_version: 0.3.0\n";
+  const noteType = "---\nkind: mdbase.type\n---\n";
   const hosted = new MemoryAuthority({
     snapshotPageSize: 1,
     resources: {
@@ -753,8 +760,8 @@ test("portable mirror materializes resources and records through Obsidian Vault 
       types: [],
       contracts: [],
       documents: [
-        { path: "mdbase.yaml", kind: "configuration", revision: "config-1", document: "spec_version: 0.3.0\n" },
-        { path: "_types/note.md", kind: "type", revision: "type-1", document: "---\nkind: mdbase.type\n---\n" },
+        { path: "mdbase.yaml", kind: "configuration", revision: sha256Revision(configuration), document: configuration },
+        { path: "_types/note.md", kind: "type", revision: sha256Revision(noteType), document: noteType },
       ],
     },
   });

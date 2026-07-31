@@ -331,6 +331,8 @@ const callbacks = {
 
 test("adopts every canonical resource and retains the existing vault as a mirror", async () => {
   const { vault, settings, adoption, controller, collectionId } = await fixture();
+  const opaqueDocument = "---\ntitle: [unterminated\n---\nOpaque body\n";
+  await vault.put("tasks/opaque.md", opaqueDocument);
   const profile = await controller.adoptLocalCollection({
     controlUrl: "https://connect.example",
     mirrorName: "Obsidian",
@@ -348,7 +350,11 @@ test("adopts every canonical resource and retains the existing vault as a mirror
       ["view", "views/tasks.base"],
     ],
   );
-  assert.equal(final.records[0]?.path, "tasks/one.md");
+  assert.deepEqual(final.records.map(({ path }) => path), ["tasks/one.md", "tasks/opaque.md"]);
+  assert.equal(
+    final.records.find(({ path }) => path === "tasks/opaque.md")?.document,
+    opaqueDocument,
+  );
   assert.equal(await vault.adapter.exists(".mdbase/connect-role.json"), true);
   assert.equal(await vault.adapter.exists(".mdbase/authority-adoption.json"), false);
   assert.equal(await vault.adapter.exists(".mdbase/authority-adoption-snapshot.json"), false);
