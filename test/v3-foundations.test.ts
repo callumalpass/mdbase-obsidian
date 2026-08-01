@@ -3,19 +3,19 @@ import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { test } from "node:test";
 import { normalizePath, TFile, TFolder } from "obsidian";
-import { MemoryAuthority } from "@mdbase/connect-sync";
+import { MemoryAuthority } from "@mdbase-dev/connect-sync";
 import {
   DirectoryMirror,
   MemoryMirrorLease,
   MemoryMirrorStateStore,
   WritableDirectoryMirror,
-} from "@mdbase/connect-sync/mirror";
+} from "@mdbase-dev/connect-sync/mirror";
 import {
   ConnectSyncController,
   DeviceMirrorLease,
   ObsidianMirrorFileSystem,
 } from "../src/connectSync";
-import { MirrorEnrollmentClient } from "@mdbase/connect-sync/enrollment";
+import { MirrorEnrollmentClient } from "@mdbase-dev/connect-sync/enrollment";
 import {
   analyzeV02Migration,
   applyV02Migration,

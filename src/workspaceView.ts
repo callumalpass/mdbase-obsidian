@@ -6,8 +6,8 @@ import {
   TFile,
   WorkspaceLeaf,
 } from "obsidian";
-import type { MirrorInitializationPreview, MirrorProgress, MirrorStatus } from "@mdbase/connect-sync/mirror";
-import type { AuthorityAdoptionStatus } from "@mdbase/connect-sync/adoption";
+import type { MirrorInitializationPreview, MirrorProgress, MirrorStatus } from "@mdbase-dev/connect-sync/mirror";
+import type { AuthorityAdoptionStatus } from "@mdbase-dev/connect-sync/adoption";
 import type {
   ConnectSyncController,
   MirrorProfile,

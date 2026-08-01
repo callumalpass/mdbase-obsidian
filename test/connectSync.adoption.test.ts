@@ -2,7 +2,7 @@ import * as assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { normalizePath, TFile, TFolder } from "obsidian";
-import type { AuthorityImportSnapshot } from "@mdbase/connect-protocol";
+import type { AuthorityImportSnapshot } from "@mdbase-dev/connect-protocol";
 import {
   AuthorityAdoptionError,
   AuthorityAdoptionOutcomeUnknownError,
@@ -10,11 +10,11 @@ import {
   type AuthorityAdoptionSession,
   type CompletedAuthorityAdoption,
   type PreparedAuthorityAdoption,
-} from "@mdbase/connect-sync/adoption";
+} from "@mdbase-dev/connect-sync/adoption";
 import type {
   MirrorEnrollment,
   MirrorEnrollmentClient,
-} from "@mdbase/connect-sync/enrollment";
+} from "@mdbase-dev/connect-sync/enrollment";
 import {
   ConnectSyncController,
   type ConnectSyncSettingsHost,

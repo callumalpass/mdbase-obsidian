@@ -17,11 +17,11 @@ import type {
   SyncMutationReceipt,
   SyncSession,
   SyncSnapshotPage,
-} from "@mdbase/connect-protocol";
+} from "@mdbase-dev/connect-protocol";
 import {
   SyncError,
   type SyncTransport,
-} from "@mdbase/connect-sync";
+} from "@mdbase-dev/connect-sync";
 import {
   AuthorityAdoptionClient,
   AuthorityAdoptionError,
@@ -32,7 +32,7 @@ import {
   type AuthorityAdoptionStatus,
   type AuthorityAdoptionVerification,
   type CompletedAuthorityAdoption,
-} from "@mdbase/connect-sync/adoption";
+} from "@mdbase-dev/connect-sync/adoption";
 import {
   DirectoryMirror,
   type DirectoryMirrorOptions,
@@ -44,7 +44,7 @@ import {
   type MirrorStateStore,
   type MirrorStatus,
   WritableDirectoryMirror,
-} from "@mdbase/connect-sync/mirror";
+} from "@mdbase-dev/connect-sync/mirror";
 import {
   MirrorEnrollmentClient,
   type MirrorEnrollment,
@@ -52,7 +52,7 @@ import {
   type MirrorEnrollmentRequester,
   type MirrorEnrollmentStatus,
   type MirrorEnrollmentVerification,
-} from "@mdbase/connect-sync/enrollment";
+} from "@mdbase-dev/connect-sync/enrollment";
 import {
   isExcluded,
   loadMdbaseConfig,

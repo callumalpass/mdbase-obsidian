@@ -6,7 +6,7 @@ import {
   TFolder,
   Vault,
 } from "obsidian";
-import { portableMirrorRuntime } from "@mdbase/connect-sync/mirror";
+import { portableMirrorRuntime } from "@mdbase-dev/connect-sync/mirror";
 import {
   fieldsFromV03Schema,
   formatMarkdown,

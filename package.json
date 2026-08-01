@@ -32,9 +32,9 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
-    "@callumalpass/mdbase-interop": "file:vendor/callumalpass-mdbase-interop-0.1.0-rc.2.tgz",
-    "@mdbase/connect-protocol": "file:vendor/mdbase-connect-protocol-0.1.0-beta.21-35c137579861.tgz",
-    "@mdbase/connect-sync": "file:vendor/mdbase-connect-sync-0.1.0-beta.21-35c137579861.tgz",
+    "@callumalpass/mdbase-interop": "0.1.0-rc.2",
+    "@mdbase-dev/connect-protocol": "0.1.0-beta.21",
+    "@mdbase-dev/connect-sync": "0.1.0-beta.21",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "picomatch": "^4.0.5"
