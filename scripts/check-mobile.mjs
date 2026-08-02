@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 const bundle = await readFile(new URL("../main.js", import.meta.url));
 const source = bundle.toString("utf8");
 const gzipBytes = gzipSync(bundle).byteLength;
-const rawBudget = 550 * 1024;
+const rawBudget = 575 * 1024;
 const gzipBudget = 170 * 1024;
 const forbidden = [
   /require\((["'])node:(?:fs|path|crypto|os|worker_threads|child_process)\1\)/,
@@ -30,4 +30,3 @@ console.log(JSON.stringify({
   raw_budget: rawBudget,
   gzip_budget: gzipBudget,
 }));
-

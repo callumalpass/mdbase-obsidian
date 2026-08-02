@@ -2,7 +2,7 @@ import * as assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { normalizePath, TFile, TFolder } from "obsidian";
-import type { AuthorityImportSnapshot } from "@mdbase/connect-protocol";
+import type { AuthorityImportSnapshot } from "@mdbase-dev/connect-protocol";
 import {
   AuthorityAdoptionError,
   AuthorityAdoptionOutcomeUnknownError,
@@ -10,11 +10,11 @@ import {
   type AuthorityAdoptionSession,
   type CompletedAuthorityAdoption,
   type PreparedAuthorityAdoption,
-} from "@mdbase/connect-sync/adoption";
+} from "@mdbase-dev/connect-sync/adoption";
 import type {
   MirrorEnrollment,
   MirrorEnrollmentClient,
-} from "@mdbase/connect-sync/enrollment";
+} from "@mdbase-dev/connect-sync/enrollment";
 import {
   ConnectSyncController,
   type ConnectSyncSettingsHost,
@@ -202,8 +202,10 @@ class FakeAdoption {
       status: "ready",
       adoption: this.adoptionView("prepared"),
       import: {
+        import_id: this.adoptionId,
         manifest_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/manifest`,
         records_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/records`,
+        files_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/files`,
         finalize_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/finalize`,
         access_token: "ati_test_secret_abcdefghijklmnopqrstuvwxyz",
       },

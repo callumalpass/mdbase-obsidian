@@ -11,17 +11,19 @@ import {
 import picomatch from "picomatch";
 import type {
   AuthorityImportSnapshot,
+  CollectionFileDescriptor,
   JsonObject,
   SyncChangesPage,
+  SyncFileSnapshotPage,
   SyncMutation,
   SyncMutationReceipt,
   SyncSession,
   SyncSnapshotPage,
-} from "@mdbase/connect-protocol";
+} from "@mdbase-dev/connect-protocol";
 import {
   SyncError,
   type SyncTransport,
-} from "@mdbase/connect-sync";
+} from "@mdbase-dev/connect-sync";
 import {
   AuthorityAdoptionClient,
   AuthorityAdoptionError,
@@ -32,7 +34,7 @@ import {
   type AuthorityAdoptionStatus,
   type AuthorityAdoptionVerification,
   type CompletedAuthorityAdoption,
-} from "@mdbase/connect-sync/adoption";
+} from "@mdbase-dev/connect-sync/adoption";
 import {
   DirectoryMirror,
   type DirectoryMirrorOptions,
@@ -44,7 +46,7 @@ import {
   type MirrorStateStore,
   type MirrorStatus,
   WritableDirectoryMirror,
-} from "@mdbase/connect-sync/mirror";
+} from "@mdbase-dev/connect-sync/mirror";
 import {
   MirrorEnrollmentClient,
   type MirrorEnrollment,
@@ -52,7 +54,7 @@ import {
   type MirrorEnrollmentRequester,
   type MirrorEnrollmentStatus,
   type MirrorEnrollmentVerification,
-} from "@mdbase/connect-sync/enrollment";
+} from "@mdbase-dev/connect-sync/enrollment";
 import {
   isExcluded,
   loadMdbaseConfig,
@@ -201,6 +203,7 @@ export function createObsidianAdoptionRequester(): AuthorityAdoptionRequester {
 export class ObsidianSyncTransport<Frontmatter extends JsonObject = JsonObject>
 implements SyncTransport<Frontmatter> {
   private readonly syncUrl: string;
+  private readonly filesUrl: string;
 
   constructor(
     syncUrl: string,
@@ -229,6 +232,7 @@ implements SyncTransport<Frontmatter> {
       throw new SyncError("invalid_sync_url", "Sync URL must identify one authority sync endpoint.");
     }
     this.syncUrl = endpoint.href.replace(/\/$/, "");
+    this.filesUrl = this.syncUrl.replace(/\/sync$/, "/files");
   }
 
   openSession(): Promise<SyncSession> {
@@ -241,6 +245,74 @@ implements SyncTransport<Frontmatter> {
     return this.request("GET", `snapshot?${query.toString()}`);
   }
 
+  fileSnapshot(snapshotId: string, page?: string): Promise<SyncFileSnapshotPage> {
+    const query = new URLSearchParams({ snapshot_id: snapshotId });
+    if (page) query.set("page", page);
+    return this.request("GET", `files/snapshot?${query.toString()}`);
+  }
+
+  async *downloadFile(file: CollectionFileDescriptor): AsyncGenerator<Uint8Array> {
+    const transferId = crypto.randomUUID();
+    try {
+      const session = await this.fileRequest<Record<string, unknown>>("POST", "downloads", {
+        protocol_version: 1,
+        type: "open_file_download",
+        transfer_id: transferId,
+        file_id: file.file_id,
+        revision: file.revision,
+      });
+      const strategy = isRecord(session.strategy) ? session.strategy : {};
+      const partSize = strategy.part_size;
+      if (
+        session.protocol_version !== 1
+        || session.type !== "file_transfer"
+        || session.transfer_id !== transferId
+        || session.direction !== "download"
+        || session.protection !== "transport_tls"
+        || session.total_size !== file.size
+        || strategy.kind !== "object_ranges"
+        || !Number.isSafeInteger(partSize)
+        || (partSize as number) <= 0
+      ) {
+        throw new SyncError(
+          "invalid_sync_response",
+          "The authority returned an incompatible file download session.",
+        );
+      }
+
+      const partCount = Math.ceil(file.size / (partSize as number));
+      for (let partIndex = 0; partIndex < partCount; partIndex += 1) {
+        const expectedLength = Math.min(partSize as number, file.size - partIndex * (partSize as number));
+        const response = await requestUrl({
+          url: `${this.filesUrl}/downloads/${encodeURIComponent(transferId)}/parts/${partIndex}`,
+          method: "GET",
+          headers: { authorization: `Bearer ${this.accessToken}` },
+          throw: false,
+        });
+        if (response.status < 200 || response.status >= 300) {
+          const value = parseJsonResponse(response.text, response.json);
+          const error = isRecord(value) && isRecord(value.error) ? value.error : {};
+          throw new SyncError(
+            typeof error.code === "string" ? error.code : "file_download_failed",
+            typeof error.message === "string"
+              ? error.message
+              : `File download failed (${response.status}).`,
+          );
+        }
+        if (response.arrayBuffer.byteLength !== expectedLength) {
+          throw new SyncError(
+            "file_integrity_failed",
+            "The authority returned a file part with the wrong length.",
+          );
+        }
+        yield new Uint8Array(response.arrayBuffer);
+      }
+    } finally {
+      await this.fileRequest("DELETE", `transfers/${encodeURIComponent(transferId)}`)
+        .catch(() => undefined);
+    }
+  }
+
   changes(after: number, limit = 200): Promise<SyncChangesPage<Frontmatter>> {
     const query = new URLSearchParams({ after: String(after), limit: String(limit) });
     return this.request("GET", `changes?${query.toString()}`);
@@ -250,9 +322,26 @@ implements SyncTransport<Frontmatter> {
     return this.request("POST", "mutations", mutation);
   }
 
-  private async request<Result>(method: "GET" | "POST", path: string, body?: unknown): Promise<Result> {
+  private request<Result>(method: "GET" | "POST", path: string, body?: unknown): Promise<Result> {
+    return this.requestAt(this.syncUrl, method, path, body);
+  }
+
+  private fileRequest<Result>(
+    method: "GET" | "POST" | "DELETE",
+    path: string,
+    body?: unknown,
+  ): Promise<Result> {
+    return this.requestAt(this.filesUrl, method, path, body);
+  }
+
+  private async requestAt<Result>(
+    baseUrl: string,
+    method: "GET" | "POST" | "DELETE",
+    path: string,
+    body?: unknown,
+  ): Promise<Result> {
     const response = await requestUrl({
-      url: `${this.syncUrl}/${path}`,
+      url: `${baseUrl}/${path}`,
       method,
       headers: {
         authorization: `Bearer ${this.accessToken}`,
@@ -340,6 +429,73 @@ export class ObsidianMirrorFileSystem implements MirrorFileSystem {
       .filter((path) => !excluded.has(path))
       .filter((path) => !RESERVED_WRITE_PREFIXES.some((prefix) => path.startsWith(prefix)))
       .sort();
+  }
+
+  async inspectBinary(input: string): Promise<{ size: number; content_digest: `sha256:${string}` } | null> {
+    const path = safeMirrorPath(input);
+    const file = this.vault.getAbstractFileByPath(path);
+    if (file == null) return null;
+    if (!(file instanceof TFile)) {
+      throw new SyncError("mirror_path_collision", `Expected a file at ${path}.`);
+    }
+    const bytes = await this.vault.readBinary(file);
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return { size: bytes.byteLength, content_digest: `sha256:${hex}` };
+  }
+
+  async writeBinary(input: string, source: AsyncIterable<Uint8Array>): Promise<void> {
+    const path = safeMirrorPath(input);
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for await (const chunk of source) {
+      if (!(chunk instanceof Uint8Array) || !Number.isSafeInteger(size + chunk.byteLength)) {
+        throw new SyncError("invalid_file_materialization", "The binary file stream is invalid or too large.");
+      }
+      chunks.push(chunk);
+      size += chunk.byteLength;
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    const slash = path.lastIndexOf("/");
+    if (slash >= 0) await ensureFolder(this.vault, path.slice(0, slash));
+    const existing = this.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFolder) {
+      throw new SyncError("mirror_path_collision", `A folder blocks the mirror file ${path}.`);
+    }
+    if (existing instanceof TFile) {
+      await this.vault.modifyBinary(existing, bytes.buffer);
+    } else {
+      await this.vault.createBinary(path, bytes.buffer);
+    }
+  }
+
+  async listBinary(excluded: ReadonlySet<string>): Promise<string[]> {
+    return this.vault
+      .getFiles()
+      .map((file) => normalizePath(file.path))
+      .filter((path) => !path.toLowerCase().endsWith(".md"))
+      .filter((path) => !excluded.has(path))
+      .filter((path) => !RESERVED_WRITE_PREFIXES.some((prefix) => path.startsWith(prefix)))
+      .sort();
+  }
+
+  async readBinary(input: string): Promise<AsyncIterable<Uint8Array> | null> {
+    const path = safeMirrorPath(input);
+    const file = this.vault.getAbstractFileByPath(path);
+    if (file == null) return null;
+    if (!(file instanceof TFile)) {
+      throw new SyncError("mirror_path_collision", `Expected a file at ${path}.`);
+    }
+    const bytes = new Uint8Array(await this.vault.readBinary(file));
+    return (async function* (): AsyncGenerator<Uint8Array> {
+      yield bytes;
+    })();
   }
 }
 
