@@ -202,8 +202,10 @@ class FakeAdoption {
       status: "ready",
       adoption: this.adoptionView("prepared"),
       import: {
+        import_id: this.adoptionId,
         manifest_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/manifest`,
         records_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/records`,
+        files_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/files`,
         finalize_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/finalize`,
         access_token: "ati_test_secret_abcdefghijklmnopqrstuvwxyz",
       },

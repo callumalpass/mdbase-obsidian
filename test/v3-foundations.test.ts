@@ -36,6 +36,7 @@ import {
 interface StoredFile {
   file: TFile;
   content: string;
+  binary?: ArrayBuffer;
 }
 
 const TestFile = TFile as unknown as { new (path: string): TFile };
@@ -82,6 +83,10 @@ class MemoryVault {
     return [...this.files.values()].map((entry) => entry.file).filter((file) => file.extension === "md");
   }
 
+  getFiles(): TFile[] {
+    return [...this.files.values()].map((entry) => entry.file);
+  }
+
   async cachedRead(file: TFile): Promise<string> {
     const entry = this.files.get(file.path);
     if (!entry) throw new Error(`missing ${file.path}`);
@@ -113,6 +118,24 @@ class MemoryVault {
       return;
     }
     this.files.set(file.path, { file, content });
+  }
+
+  async readBinary(file: TFile): Promise<ArrayBuffer> {
+    const entry = this.files.get(file.path);
+    if (!entry) throw new Error(`missing ${file.path}`);
+    return entry.binary?.slice(0) ?? new TextEncoder().encode(entry.content).buffer;
+  }
+
+  async createBinary(path: string, value: ArrayBuffer): Promise<TFile> {
+    const normalized = normalizePath(path);
+    if (this.files.has(normalized) || this.folders.has(normalized)) throw new Error(`exists ${normalized}`);
+    const file = new TestFile(normalized);
+    this.files.set(normalized, { file, content: "", binary: value.slice(0) });
+    return file;
+  }
+
+  async modifyBinary(file: TFile, value: ArrayBuffer): Promise<void> {
+    this.files.set(file.path, { file, content: "", binary: value.slice(0) });
   }
 
   async createFolder(path: string): Promise<void> {
@@ -513,6 +536,37 @@ test("Obsidian mirror adapter rejects traversal and reserved paths", async () =>
   assert.equal(await fs.read("notes/ok.md"), "hello");
   await fs.remove("notes/ok.md");
   assert.equal(await fs.read("notes/ok.md"), null);
+});
+
+test("Obsidian mirror adapter round-trips and verifies binary files", async () => {
+  const vault = new MemoryVault();
+  const fs = new ObsidianMirrorFileSystem(vault as never);
+  const bytes = new Uint8Array([137, 80, 78, 71, 1, 2, 3, 4]);
+  await fs.writeBinary("attachments/tasks/task-1/photo.png", (async function* () {
+    yield bytes.slice(0, 3);
+    yield bytes.slice(3);
+  })());
+
+  assert.deepEqual(await fs.inspectBinary("attachments/tasks/task-1/photo.png"), {
+    size: bytes.byteLength,
+    content_digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+  });
+  assert.deepEqual(await fs.listBinary(new Set()), ["attachments/tasks/task-1/photo.png"]);
+  const source = await fs.readBinary("attachments/tasks/task-1/photo.png");
+  assert.ok(source);
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of source) chunks.push(chunk);
+  assert.deepEqual(chunks, [bytes]);
+
+  const replacement = new Uint8Array([9, 8, 7]);
+  await fs.writeBinary("attachments/tasks/task-1/photo.png", (async function* () {
+    yield replacement;
+  })());
+  assert.equal((await fs.inspectBinary("attachments/tasks/task-1/photo.png"))?.size, 3);
+  await assert.rejects(
+    fs.writeBinary(".obsidian/photo.png", (async function* () { yield bytes; })()),
+    /reserved path/,
+  );
 });
 
 test("Connect enrollment keeps credentials out of plugin data and refuses local-authority vaults", async () => {
