@@ -1095,12 +1095,18 @@ export default class MdbasePlugin extends Plugin {
       return;
     }
     try {
-      const status = await this.connectSync.sync();
+      const reviewed = await this.connectSync.preview();
+      const outcome = await this.connectSync.sync(reviewed);
+      const status = await this.connectSync.status();
       this.invalidateSchemaCache();
       this.refreshWorkspaceViews(true);
-      const attentionCount = status.conflicts.length + status.local_issues.length;
+      const attentionCount = (status?.conflicts.length ?? 0) + (status?.local_issues.length ?? 0);
       new Notice(
-        attentionCount
+        outcome.status === "stale"
+          ? "The sync plan changed before it could apply. Review the new plan in the mdbase workspace."
+          : outcome.status === "failed" || outcome.status === "blocked"
+            ? `mdbase sync stopped safely: ${outcome.failure?.message ?? outcome.status}.`
+            : attentionCount
           ? `Sync completed with ${attentionCount} item${attentionCount === 1 ? "" : "s"} needing attention.`
           : "mdbase sync completed.",
       );
