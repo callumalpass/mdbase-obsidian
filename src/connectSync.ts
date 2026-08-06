@@ -37,9 +37,9 @@ import {
 } from "@mdbase-dev/connect-sync/adoption";
 import {
   DirectoryMirror,
+  type MirrorApplyResult,
   type DirectoryMirrorOptions,
   type MirrorFileSystem,
-  type MirrorInitializationPreview,
   type MirrorLease,
   type MirrorProgress,
   type MirrorState,
@@ -60,6 +60,7 @@ import {
   loadMdbaseConfig,
   normalizeSafeRelativePath,
 } from "./mdbaseCore";
+import { type MdbaseSyncPreview, previewFromPlan } from "./syncPreview";
 
 export interface MirrorProfile {
   version: 1;
@@ -107,7 +108,7 @@ export interface ConnectSyncSettingsHost {
 const ROLE_MARKER_PATH = ".mdbase/connect-role.json";
 const ADOPTION_MARKER_PATH = ".mdbase/authority-adoption.json";
 const ADOPTION_SNAPSHOT_PATH = ".mdbase/authority-adoption-snapshot.json";
-const STATE_DATABASE = "mdbase-obsidian-connect";
+const STATE_DATABASE = "mdbase-obsidian-connect-exact-v1";
 const STATE_STORE = "mirrors";
 const ACCESS_SECRET_PREFIX = "mdbase-connect-access-";
 const REFRESH_SECRET_PREFIX = "mdbase-connect-refresh-";
@@ -387,6 +388,12 @@ async function ensureFolder(vault: Vault, path: string): Promise<void> {
 export class ObsidianMirrorFileSystem implements MirrorFileSystem {
   constructor(private readonly vault: Vault) {}
 
+  async exists(input: string): Promise<boolean> {
+    const path = safeMirrorPath(input);
+    return this.vault.getAbstractFileByPath(path) !== null
+      || await this.vault.adapter.exists(path);
+  }
+
   async read(input: string): Promise<string | null> {
     const path = safeMirrorPath(input);
     const file = this.vault.getAbstractFileByPath(path);
@@ -410,6 +417,21 @@ export class ObsidianMirrorFileSystem implements MirrorFileSystem {
     } else {
       await this.vault.create(path, value);
     }
+  }
+
+  async move(sourceInput: string, targetInput: string): Promise<void> {
+    const source = safeMirrorPath(sourceInput);
+    const target = safeMirrorPath(targetInput);
+    const slash = target.lastIndexOf("/");
+    if (slash >= 0) await ensureFolder(this.vault, target.slice(0, slash));
+    const sourceFile = this.vault.getAbstractFileByPath(source);
+    if (!(sourceFile instanceof TFile)) {
+      throw new SyncError("mirror_path_collision", `Expected a file at ${source}.`);
+    }
+    if (this.vault.getAbstractFileByPath(target) !== null || await this.vault.adapter.exists(target)) {
+      throw new SyncError("mirror_path_collision", `A file or folder blocks ${target}.`);
+    }
+    await this.vault.rename(sourceFile, target);
   }
 
   async remove(input: string): Promise<void> {
@@ -574,6 +596,7 @@ export interface ConnectSyncControllerOptions {
 
 export class ConnectSyncController {
   private progress: MirrorProgress | null = null;
+  private syncAbort: AbortController | null = null;
   private readonly fileSystem: MirrorFileSystem;
   private readonly enrollmentClient: MirrorEnrollmentClient;
   private readonly adoptionClient: AuthorityAdoptionClient;
@@ -605,6 +628,10 @@ export class ConnectSyncController {
 
   getProgress(): MirrorProgress | null {
     return this.progress ? { ...this.progress } : null;
+  }
+
+  cancelSync(): void {
+    this.syncAbort?.abort();
   }
 
   getAdoptionMarker(): Readonly<AdoptionMarker> | null {
@@ -727,9 +754,9 @@ export class ConnectSyncController {
     return this.requireProfile();
   }
 
-  async preview(): Promise<MirrorInitializationPreview> {
+  async preview(): Promise<MdbaseSyncPreview> {
     const mirror = await this.createMirror();
-    return mirror.previewInitialization();
+    return previewFromPlan(await mirror.inspect());
   }
 
   async status(): Promise<MirrorStatus | null> {
@@ -740,16 +767,24 @@ export class ConnectSyncController {
     return mirror.status();
   }
 
-  async sync(onProgress?: (progress: MirrorProgress) => void): Promise<MirrorStatus> {
+  async sync(
+    reviewed: MdbaseSyncPreview,
+    onProgress?: (progress: MirrorProgress) => void,
+  ): Promise<MirrorApplyResult> {
+    if (this.syncAbort) {
+      throw new SyncError("mirror_busy", "Synchronization is already running for this vault.");
+    }
+    const abort = new AbortController();
+    this.syncAbort = abort;
     const mirror = await this.createMirror((next) => {
       this.progress = next;
       onProgress?.({ ...next });
     });
     try {
-      await mirror.sync();
-      return mirror.status();
+      return await mirror.apply(reviewed.plan, { signal: abort.signal });
     } finally {
       this.progress = null;
+      this.syncAbort = null;
     }
   }
 

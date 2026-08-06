@@ -6,7 +6,7 @@ import {
   TFile,
   WorkspaceLeaf,
 } from "obsidian";
-import type { MirrorInitializationPreview, MirrorProgress, MirrorStatus } from "@mdbase-dev/connect-sync/mirror";
+import type { MirrorProgress, MirrorStatus } from "@mdbase-dev/connect-sync/mirror";
 import type { AuthorityAdoptionStatus } from "@mdbase-dev/connect-sync/adoption";
 import type {
   ConnectSyncController,
@@ -20,6 +20,7 @@ import type {
 import { formatMarkdown, parseFrontmatter } from "./mdbaseCore";
 import type { V02MigrationPlan } from "./migration";
 import { MDBASE_ICON_ID } from "./mdbaseIcon";
+import type { MdbaseSyncPreview } from "./syncPreview";
 import type { TypeEditorField, TypeEditorModel } from "./typeEditorTypes";
 import {
   createDefaultTypeModel,
@@ -169,7 +170,7 @@ export class MdbaseWorkspaceView extends ItemView {
   private migrationPlan: V02MigrationPlan | null = null;
   private allowLossy = false;
   private mirrorStatus: MirrorStatus | null = null;
-  private mirrorPreview: MirrorInitializationPreview | null = null;
+  private mirrorPreview: MdbaseSyncPreview | null = null;
   private mirrorProgress: MirrorProgress | null = null;
   private transientMessage = "";
   private issueQuery = "";
@@ -868,24 +869,52 @@ export class MdbaseWorkspaceView extends ItemView {
         cls: "mdbase-progress-label",
         text: `${this.mirrorProgress.phase}: ${this.mirrorProgress.completed}${total == null ? "" : ` of ${total}`}`,
       });
+      const cancel = status.createEl("button", { text: "Stop safely" });
+      cancel.onclick = () => {
+        this.host.connectSync.cancelSync();
+        this.transientMessage = "Stopping after the current action boundary…";
+        this.render();
+      };
     }
     const actions = status.createDiv({ cls: "mdbase-actions" });
     const preview = actions.createEl("button", { text: "Preview" });
     preview.disabled = this.busy;
     preview.onclick = () => void this.perform(async () => {
       this.mirrorPreview = await this.host.connectSync.preview();
+      this.transientMessage = this.mirrorPreview.entries.length
+        ? "Review the engine plan below, then sync when ready."
+        : "No content effects are needed; confirm the sync checkpoint when ready.";
       this.render();
     });
-    const sync = actions.createEl("button", { text: "Sync now" });
+    const plannedOutcomeCount = this.mirrorPreview?.plan.actions
+      .filter((action) => action.command !== "advance_checkpoint").length ?? 0;
+    const hasBlockingIssue = (this.mirrorPreview?.plan.summary.blocking_issues ?? 0) > 0;
+    const sync = actions.createEl("button", {
+      text: this.mirrorPreview
+        ? plannedOutcomeCount
+          ? `Sync ${plannedOutcomeCount} ${plannedOutcomeCount === 1 ? "outcome" : "outcomes"}`
+          : "Confirm sync checkpoint"
+        : "Review before syncing",
+    });
     sync.addClass("mod-cta");
-    sync.disabled = this.busy;
+    sync.disabled = this.busy || !this.mirrorPreview || hasBlockingIssue;
     sync.onclick = () => void this.perform(async () => {
-      this.mirrorStatus = await this.host.connectSync.sync((progress) => {
+      const outcome = await this.host.connectSync.sync(this.mirrorPreview!, (progress) => {
         this.mirrorProgress = progress;
         this.render();
       });
+      this.mirrorStatus = await this.host.connectSync.status();
+      this.mirrorPreview = await this.host.connectSync.preview();
       this.mirrorProgress = null;
-      this.transientMessage = "Sync completed and the local checkpoint was verified.";
+      this.transientMessage = outcome.status === "applied"
+        ? "Sync completed and the local checkpoint was verified."
+        : outcome.status === "attention"
+          ? "Sync checkpointed completed actions and recorded the items that need attention."
+          : outcome.status === "cancelled"
+            ? `Sync stopped safely after ${outcome.applied} actions; ${outcome.pending} remain pending.`
+            : outcome.status === "stale"
+              ? "The reviewed plan became stale. Review the new engine plan before syncing again."
+              : `Sync stopped at a durable action boundary: ${outcome.failure?.message ?? outcome.status}.`;
       await this.refresh(true);
     });
 
@@ -1074,13 +1103,22 @@ export class MdbaseWorkspaceView extends ItemView {
     }
   }
 
-  private renderMirrorPreview(container: HTMLElement, preview: MirrorInitializationPreview): void {
+  private renderMirrorPreview(container: HTMLElement, preview: MdbaseSyncPreview): void {
     const section = container.createEl("section", { cls: "mdbase-editor-section" });
     section.createEl("h3", { text: "Sync preview" });
     const values = section.createDiv({ cls: "mdbase-status-list" });
     renderStatus(values, "Download documents", String(preview.download_documents));
     renderStatus(values, "Upload documents", String(preview.upload_documents));
     renderStatus(values, "Unchanged documents", String(preview.unchanged_documents));
+    renderStatus(values, "Plan", preview.plan.fingerprint);
+    if (preview.entries.length) {
+      const list = section.createEl("ul");
+      for (const entry of preview.entries.slice(0, 200)) {
+        list.createEl("li", {
+          text: `${entry.direction === "attention" ? "Attention" : entry.direction}: ${entry.path} — ${entry.detail}`,
+        });
+      }
+    }
     if (preview.collisions.length) {
       section.createDiv({
         cls: "mdbase-inline-error",

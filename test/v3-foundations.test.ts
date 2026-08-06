@@ -120,6 +120,17 @@ class MemoryVault {
     this.files.set(file.path, { file, content });
   }
 
+  async rename(file: TFile, target: string): Promise<void> {
+    const normalized = normalizePath(target);
+    if (this.files.has(normalized) || this.folders.has(normalized)) {
+      throw new Error(`exists ${normalized}`);
+    }
+    const entry = this.files.get(file.path);
+    if (!entry) throw new Error(`missing ${file.path}`);
+    this.files.delete(file.path);
+    this.files.set(normalized, { ...entry, file: new TestFile(normalized) });
+  }
+
   async readBinary(file: TFile): Promise<ArrayBuffer> {
     const entry = this.files.get(file.path);
     if (!entry) throw new Error(`missing ${file.path}`);
@@ -526,16 +537,22 @@ test("type model edits recursive lists, objects, and nested links without flatte
   );
 });
 
-test("Obsidian mirror adapter rejects traversal and reserved paths", async () => {
+test("Obsidian mirror adapter rejects unsafe paths and performs vacancy-checked moves", async () => {
   const vault = new MemoryVault();
   const fs = new ObsidianMirrorFileSystem(vault as never);
   await assert.rejects(fs.write("../escape.md", "x"), /escapes the collection root/);
   await assert.rejects(fs.write(".obsidian/plugins/evil.js", "x"), /reserved path/);
   await assert.rejects(fs.write(".mdbase/connect-role.json", "x"), /reserved path/);
   await fs.write("notes/ok.md", "hello");
+  assert.equal(await fs.exists("notes/ok.md"), true);
   assert.equal(await fs.read("notes/ok.md"), "hello");
-  await fs.remove("notes/ok.md");
+  await fs.move("notes/ok.md", "notes/moved.md");
   assert.equal(await fs.read("notes/ok.md"), null);
+  assert.equal(await fs.read("notes/moved.md"), "hello");
+  await fs.write("notes/occupied.md", "occupied");
+  await assert.rejects(fs.move("notes/moved.md", "notes/occupied.md"), /blocks/);
+  await fs.remove("notes/moved.md");
+  assert.equal(await fs.exists("notes/moved.md"), false);
 });
 
 test("Obsidian mirror adapter round-trips and verifies binary files", async () => {
@@ -895,7 +912,11 @@ test("writable mirror uploads local edits and collision preflight makes no write
     fileSystem: new ObsidianMirrorFileSystem(collisionVault as never),
     stateStore: collisionState,
   });
-  await assert.rejects(checkedMirror.sync(), /already exist|collis|differ/i);
+  const collision = await checkedMirror.sync();
+  assert.equal(collision.status, "attention");
+  assert.deepEqual(collision.issues.map((issue) => [issue.code, issue.path, issue.blocking]), [
+    ["local_collision", "notes/one.md", true],
+  ]);
   assert.equal(collisionVault.read("notes/one.md"), "unmanaged bytes");
   assert.equal(await collisionState.read(), null);
 });
@@ -926,10 +947,16 @@ test("interrupted mirror write does not advance the checkpoint and a retry conve
     fileSystem: new ObsidianMirrorFileSystem(vault as never),
     stateStore: state,
   });
-  await assert.rejects(mirror.sync(), /injected adapter create failure/);
-  assert.equal(await state.read(), null);
+  const interrupted = await mirror.sync();
+  assert.equal(interrupted.status, "failed", JSON.stringify(interrupted));
+  assert.match(interrupted.failure?.message ?? "", /injected adapter create failure/);
+  const recovery = await state.read();
+  assert.equal(recovery?.generation, 0);
+  assert.equal(recovery?.batch?.phase, "blocked");
+  assert.equal(recovery?.batch?.next_action, 1);
   vault.failCreatePath = null;
-  await mirror.sync();
+  const applied = await mirror.sync();
+  assert.equal(applied.status, "applied", JSON.stringify(applied));
   assert.equal((await mirror.status()).state, "up_to_date");
   assert.equal(vault.getMarkdownFiles().length, 2);
 });

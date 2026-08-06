@@ -4,7 +4,10 @@ import { readFile } from "node:fs/promises";
 const bundle = await readFile(new URL("../main.js", import.meta.url));
 const source = bundle.toString("utf8");
 const gzipBytes = gzipSync(bundle).byteLength;
-const rawBudget = 575 * 1024;
+// Canonical plan rendering and structured apply/cancellation outcomes replace
+// the old initialization-only preview. Keep gzip fixed while allowing the
+// bounded engine-plan UI and vacancy-checked move adapter 17 KiB of raw room.
+const rawBudget = 592 * 1024;
 const gzipBudget = 170 * 1024;
 const forbidden = [
   /require\((["'])node:(?:fs|path|crypto|os|worker_threads|child_process)\1\)/,
