@@ -883,21 +883,28 @@ export class MdbaseWorkspaceView extends ItemView {
       this.mirrorPreview = await this.host.connectSync.preview();
       this.transientMessage = this.mirrorPreview.entries.length
         ? "Review the engine plan below, then sync when ready."
-        : "No content effects are needed; confirm the sync checkpoint when ready.";
+        : this.mirrorPreview.plan.actions.some((action) => action.command === "advance_checkpoint")
+          ? "No content effects are needed; confirm the sync checkpoint when ready."
+          : "This mirror is already up to date.";
       this.render();
     });
     const plannedOutcomeCount = this.mirrorPreview?.plan.actions
       .filter((action) => action.command !== "advance_checkpoint").length ?? 0;
+    const hasCheckpointAction = this.mirrorPreview?.plan.actions
+      .some((action) => action.command === "advance_checkpoint") ?? false;
     const hasBlockingIssue = (this.mirrorPreview?.plan.summary.blocking_issues ?? 0) > 0;
     const sync = actions.createEl("button", {
       text: this.mirrorPreview
         ? plannedOutcomeCount
           ? `Sync ${plannedOutcomeCount} ${plannedOutcomeCount === 1 ? "outcome" : "outcomes"}`
-          : "Confirm sync checkpoint"
+          : hasCheckpointAction
+            ? "Confirm sync checkpoint"
+            : "Already up to date"
         : "Review before syncing",
     });
     sync.addClass("mod-cta");
-    sync.disabled = this.busy || !this.mirrorPreview || hasBlockingIssue;
+    sync.disabled = this.busy || !this.mirrorPreview || hasBlockingIssue
+      || this.mirrorPreview.plan.actions.length === 0;
     sync.onclick = () => void this.perform(async () => {
       const outcome = await this.host.connectSync.sync(this.mirrorPreview!, (progress) => {
         this.mirrorProgress = progress;

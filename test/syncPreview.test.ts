@@ -76,6 +76,18 @@ test("sync preview is a direct projection of the engine-owned plan", () => {
   assert.equal(preview.upload_files, 1);
 });
 
+test("an exact idle plan remains an explicit zero-action preview", () => {
+  const preview = previewFromPlan(plan({
+    base_cursor: 6,
+    authority_cursor: 6,
+  }));
+
+  assert.deepEqual(preview.plan.actions, []);
+  assert.deepEqual(preview.entries, []);
+  assert.equal(preview.cursor, 6);
+  assert.equal(preview.remoteHead, 6);
+});
+
 test("plan conflicts and blocking issues are shown as attention without inventing transfers", () => {
   const preview = previewFromPlan(plan({
     actions: [{
