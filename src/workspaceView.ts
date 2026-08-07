@@ -20,6 +20,7 @@ import type {
 import { formatMarkdown, parseFrontmatter } from "./mdbaseCore";
 import type { V02MigrationPlan } from "./migration";
 import { MDBASE_ICON_ID } from "./mdbaseIcon";
+import { resolveConflictAndRefresh } from "./syncConflict";
 import type { MdbaseSyncPreview } from "./syncPreview";
 import type { TypeEditorField, TypeEditorModel } from "./typeEditorTypes";
 import {
@@ -1165,12 +1166,16 @@ export class MdbaseWorkspaceView extends ItemView {
         });
         button.disabled = this.busy;
         button.onclick = () => void this.perform(async () => {
-          this.mirrorStatus = await this.host.connectSync.resolveConflict(
+          this.mirrorPreview = null;
+          const resolved = await resolveConflictAndRefresh(
+            this.host.connectSync,
             conflict.object_id,
             conflict.decision_id,
             resolution,
           );
-          this.render();
+          this.mirrorStatus = resolved.status;
+          this.mirrorPreview = resolved.preview;
+          this.transientMessage = "Conflict resolved. Review the refreshed engine plan before syncing.";
         });
       }
     }
