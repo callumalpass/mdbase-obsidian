@@ -91,6 +91,21 @@ function actionEntry(action: MirrorPlanAction): SyncPreviewEntry {
       ...(action.entity === "record" ? { recordId: action.identity } : { fileId: action.identity }),
     };
   }
+  if (action.command === "clear_conflict") {
+    const object = action.expected_local.state === "exact"
+      ? action.expected_local.object
+      : action.expected_remote.state === "exact"
+        ? action.expected_remote.object
+        : undefined;
+    return {
+      kind: action.entity === "file" ? "file" : "document",
+      path: object?.path ?? action.identity,
+      direction: "attention",
+      action: "fix",
+      detail: `Local and hosted ${action.entity} content now matches; clear the resolved conflict.`,
+      ...(action.entity === "record" ? { recordId: action.identity } : { fileId: action.identity }),
+    };
+  }
   const localCommand = action.command.endsWith("_local");
   const object = "target" in action ? action.target : action.source;
   const path = action.command === "move_local" || action.command === "move_remote"

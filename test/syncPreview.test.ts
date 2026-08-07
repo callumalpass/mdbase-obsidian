@@ -119,3 +119,41 @@ test("plan conflicts and blocking issues are shown as attention without inventin
   assert.deepEqual(preview.entries.map((entry) => entry.direction), ["attention", "attention"]);
   assert.deepEqual(preview.collisions, ["notes/collision.md"]);
 });
+
+test("resolved conflict cleanup is projected without inventing a transfer", () => {
+  const exact = {
+    state: "exact" as const,
+    object: {
+      entity: "file" as const,
+      identity: "file-1",
+      path: "images/resolved.png",
+      revision: "file:resolved",
+      payload_revision: `sha256:${"4".repeat(64)}`,
+      size: 12,
+    },
+  };
+  const preview = previewFromPlan(plan({
+    actions: [{
+      command: "clear_conflict",
+      action_id: "clear-file-conflict",
+      depends_on: [],
+      entity: "file",
+      identity: "file-1",
+      expected_local: exact,
+      expected_remote: exact,
+      reason: "pending",
+    }],
+    summary: { uploads: 0, downloads: 0, conflicts: 0, blocking_issues: 0 },
+  }));
+
+  assert.deepEqual(preview.entries, [{
+    kind: "file",
+    path: "images/resolved.png",
+    direction: "attention",
+    action: "fix",
+    detail: "Local and hosted file content now matches; clear the resolved conflict.",
+    fileId: "file-1",
+  }]);
+  assert.equal(preview.download_files, 0);
+  assert.equal(preview.upload_files, 0);
+});

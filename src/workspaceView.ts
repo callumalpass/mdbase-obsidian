@@ -1152,7 +1152,11 @@ export class MdbaseWorkspaceView extends ItemView {
     for (const conflict of status.conflicts) {
       const row = section.createDiv({ cls: "mdbase-conflict-row" });
       const text = row.createDiv();
-      text.createEl("strong", { text: conflict.path ?? conflict.record_id });
+      text.createEl("strong", { text: conflict.path ?? conflict.object_id });
+      text.createDiv({
+        text: conflict.entity === "file" ? "Binary file conflict" : "Note conflict",
+        cls: "mdbase-muted",
+      });
       text.createDiv({ text: conflict.message });
       const actions = row.createDiv({ cls: "mdbase-actions" });
       for (const resolution of ["local", "remote"] as const) {
@@ -1161,7 +1165,11 @@ export class MdbaseWorkspaceView extends ItemView {
         });
         button.disabled = this.busy;
         button.onclick = () => void this.perform(async () => {
-          this.mirrorStatus = await this.host.connectSync.resolveConflict(conflict.record_id, resolution);
+          this.mirrorStatus = await this.host.connectSync.resolveConflict(
+            conflict.object_id,
+            conflict.decision_id,
+            resolution,
+          );
           this.render();
         });
       }
