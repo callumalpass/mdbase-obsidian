@@ -788,9 +788,13 @@ export class ConnectSyncController {
     }
   }
 
-  async resolveConflict(recordId: string, resolution: "local" | "remote"): Promise<MirrorStatus> {
+  async resolveConflict(
+    objectId: string,
+    decisionId: string,
+    resolution: "local" | "remote",
+  ): Promise<MirrorStatus> {
     const mirror = await this.createMirror();
-    await mirror.resolveConflict(recordId, resolution);
+    await mirror.resolveConflict(objectId, decisionId, resolution);
     return mirror.status();
   }
 
