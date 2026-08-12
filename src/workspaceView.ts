@@ -2273,7 +2273,7 @@ export class MdbaseWorkspaceView extends ItemView {
     this.draftSaveTimer = window.setTimeout(() => {
       this.draftSaveTimer = null;
       void this.flushTypeDraft();
-    }, 350);
+    }, 2_000);
   }
 
   private async flushTypeDraft(): Promise<void> {

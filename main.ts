@@ -57,6 +57,7 @@ import {
   type MdbaseWorkspaceSchema,
 } from "./src/workspaceView";
 import { MDBASE_ICON_ID, MDBASE_ICON_SVG } from "./src/mdbaseIcon";
+import { KeyedTrailingDebouncer } from "./src/trailingDebouncer";
 
 interface MdbasePluginSettings {
   validateOnSave: boolean;
@@ -347,8 +348,28 @@ export default class MdbasePlugin extends Plugin {
   private statusBarEl: HTMLElement;
   private schemaCache: LoadedSchema | null = null;
   private schemaLoadPromise: Promise<LoadedSchema | null> | null = null;
-  private pendingSaveValidations = new Map<string, number>();
-  private readonly saveValidationDebounceMs = 250;
+  // Obsidian commonly persists the final editor buffer about 1.3 seconds after
+  // typing stops. Wait beyond that write so the edit burst and final autosave
+  // produce one validation/schema refresh against the latest saved content.
+  private readonly saveValidationDebounceMs = 2_000;
+  private readonly schemaRefreshDebounceMs = 2_000;
+  private readonly saveValidations = new KeyedTrailingDebouncer<string, TFile>(
+    this.saveValidationDebounceMs,
+    async (file, isCurrent) => {
+      try {
+        await this.validateFileAndStore(file, "save", isCurrent);
+      } catch (error) {
+        console.error("mdbase: background validation failed", error);
+      }
+    },
+  );
+  private readonly schemaRefreshes = new KeyedTrailingDebouncer<"schema", undefined>(
+    this.schemaRefreshDebounceMs,
+    async () => {
+      this.invalidateSchemaCache();
+      this.refreshWorkspaceViews();
+    },
+  );
   private readonly interopBridge: ObsidianInteropBridge;
 
   constructor(app: App, manifest: import("obsidian").PluginManifest) {
@@ -495,6 +516,19 @@ export default class MdbasePlugin extends Plugin {
       }),
     );
 
+    this.registerEvent(
+      this.app.workspace.on("editor-change", (_editor, info) => {
+        const file = info.file;
+        if (!(file instanceof TFile)) return;
+        if (this.saveValidations.has(file.path)) {
+          this.scheduleSaveValidation(file);
+        }
+        if (this.schemaRefreshes.has("schema") && this.isSchemaRelevantPath(file.path)) {
+          this.scheduleSchemaRefresh();
+        }
+      }),
+    );
+
     const active = this.app.workspace.getActiveFile();
     if (active && this.settings.validateOnOpen) {
       void this.validateFileAndStore(active, "open");
@@ -504,7 +538,8 @@ export default class MdbasePlugin extends Plugin {
   async onunload(): Promise<void> {
     await this.interopBridge.dispose();
     this.app.workspace.getLeavesOfType(MDBASE_WORKSPACE_VIEW).forEach((leaf) => leaf.detach());
-    this.clearAllPendingSaveValidations();
+    this.saveValidations.clear();
+    this.schemaRefreshes.clear();
   }
 
   async loadSettings(): Promise<void> {
@@ -816,30 +851,22 @@ export default class MdbasePlugin extends Plugin {
     this.refreshIssueViews();
   }
 
-  private clearAllPendingSaveValidations(): void {
-    for (const handle of this.pendingSaveValidations.values()) {
-      window.clearTimeout(handle);
-    }
-    this.pendingSaveValidations.clear();
-  }
-
   private clearPendingSaveValidation(path: string): void {
-    const existing = this.pendingSaveValidations.get(path);
-    if (existing != null) {
-      window.clearTimeout(existing);
-      this.pendingSaveValidations.delete(path);
-    }
+    this.saveValidations.cancel(path);
   }
 
   private scheduleSaveValidation(file: TFile): void {
-    this.clearPendingSaveValidation(file.path);
+    this.saveValidations.schedule(file.path, file);
+  }
 
-    const handle = window.setTimeout(() => {
-      this.pendingSaveValidations.delete(file.path);
-      void this.validateFileAndStore(file, "save");
-    }, this.saveValidationDebounceMs);
+  private scheduleSchemaRefresh(): void {
+    this.schemaRefreshes.schedule("schema", undefined);
+  }
 
-    this.pendingSaveValidations.set(file.path, handle);
+  private refreshSchemaNow(): void {
+    this.schemaRefreshes.cancel("schema");
+    this.invalidateSchemaCache();
+    this.refreshWorkspaceViews();
   }
 
   private isSchemaRelevantPath(path: string): boolean {
@@ -908,8 +935,7 @@ export default class MdbasePlugin extends Plugin {
 
   private onVaultModify(file: TFile): void {
     if (this.isSchemaRelevantPath(file.path)) {
-      this.invalidateSchemaCache();
-      this.refreshWorkspaceViews();
+      this.scheduleSchemaRefresh();
     }
 
     if (!this.settings.validateOnSave) return;
@@ -919,8 +945,7 @@ export default class MdbasePlugin extends Plugin {
 
   private onVaultRename(file: TFile, oldPath: string): void {
     if (this.isSchemaRelevantPath(oldPath) || this.isSchemaRelevantPath(file.path)) {
-      this.invalidateSchemaCache();
-      this.refreshWorkspaceViews();
+      this.refreshSchemaNow();
     }
 
     if (file.extension !== "md") return;
@@ -935,8 +960,7 @@ export default class MdbasePlugin extends Plugin {
 
   private onVaultDelete(file: TFile): void {
     if (this.isSchemaRelevantPath(file.path)) {
-      this.invalidateSchemaCache();
-      this.refreshWorkspaceViews();
+      this.refreshSchemaNow();
     }
 
     if (file.extension !== "md") return;
@@ -946,13 +970,17 @@ export default class MdbasePlugin extends Plugin {
 
   private onVaultCreate(file: TFile): void {
     if (this.isSchemaRelevantPath(file.path)) {
-      this.invalidateSchemaCache();
-      this.refreshWorkspaceViews();
+      this.refreshSchemaNow();
     }
   }
 
-  private async validateFileAndStore(file: TFile, reason: "save" | "open" | "manual"): Promise<MdbaseIssue[]> {
+  private async validateFileAndStore(
+    file: TFile,
+    reason: "save" | "open" | "manual",
+    isCurrent: () => boolean = () => true,
+  ): Promise<MdbaseIssue[]> {
     const loaded = await this.requireConfigAndTypes({ background: reason !== "manual" });
+    if (!isCurrent()) return [];
     if (!loaded) {
       if (reason !== "manual") {
         this.clearFileIssues(file.path);
@@ -961,6 +989,7 @@ export default class MdbasePlugin extends Plugin {
     }
 
     const issues = await validateFile(this.app.vault, file, loaded.config, loaded.types);
+    if (!isCurrent()) return issues;
     this.setFileIssues(file.path, issues);
 
     if (reason === "save" && this.settings.showNoticeOnSave && issues.length > 0) {

@@ -24,6 +24,7 @@
     "src/migration.ts",
     "src/typeModel.ts",
     "src/typeEditorTypes.ts",
+    "src/trailingDebouncer.ts",
     "test/**/*.ts"
   ]
 }
