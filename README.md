@@ -55,6 +55,24 @@ can resume safely. Binary creates, updates, moves, deletes, and conflicts appear
 as files—not Markdown—in the preflight ledger. Local collection adoption uses
 the same policy and stages exact bytes for both warm and fenced snapshots.
 
+The status bar reports whether the mirror is synced, has changes waiting, is
+transferring a named file, is paused, or needs attention. The sync workspace
+keeps a bounded recent-activity ledger, shows byte progress for large files,
+and translates expired approval, offline service, stale review, cancellation,
+and durable recovery into explicit next actions. Conflict review provides a
+bounded Markdown diff or binary metadata and a local image preview, with
+**Keep local**, **Use hosted**, and collision-safe **Keep both** decisions.
+
+Disconnecting is explicit: retain the vault as a local unsynced copy, or remove
+only files that still exactly match the last durable checkpoint. Locally
+changed files are always preserved. The plugin removes the connection before
+it starts file deletion, so failed settings persistence cannot turn local
+cleanup into remote deletions.
+
+Useful Obsidian commands include **mdbase: Review sync changes**, **mdbase: Sync
+now**, **mdbase: Cancel current sync**, **mdbase: Open sync activity**,
+**mdbase: Resolve sync conflicts**, and **mdbase: Reconnect collection**.
+
 ## Type workbench
 
 Open **mdbase: Open workspace** and choose **Types**.

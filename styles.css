@@ -43,6 +43,13 @@
   outline-offset: 2px;
 }
 
+.mdbase-status-bar[data-state="synced"] { color: var(--text-success); }
+.mdbase-status-bar[data-state="syncing"] { color: var(--interactive-accent); }
+.mdbase-status-bar[data-state="waiting"] { color: var(--text-muted); }
+.mdbase-status-bar[data-state="attention"],
+.mdbase-status-bar[data-state="paused"] { color: var(--text-warning); }
+.mdbase-status-bar[data-state="offline"] { color: var(--text-error); }
+
 .mdbase-workspace {
   container-name: mdbase-workspace;
   container-type: inline-size;
@@ -1230,6 +1237,28 @@ details.mdbase-field-node {
   min-height: 30px;
 }
 
+.mdbase-recovery-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-left: 3px solid var(--text-warning);
+  background: var(--background-secondary);
+}
+
+.mdbase-recovery-card strong,
+.mdbase-recovery-card div div {
+  display: block;
+}
+
+.mdbase-recovery-card div div {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
 .mdbase-transfer-review {
   margin: 0 0 28px;
   border-top: 2px solid var(--text-normal);
@@ -1359,6 +1388,89 @@ details.mdbase-field-node {
   line-height: 1.35;
   text-transform: uppercase;
 }
+
+.mdbase-transfer-size {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  font-variant-numeric: tabular-nums;
+}
+
+.mdbase-activity .mdbase-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mdbase-activity-row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 9px;
+  padding: 10px 0;
+  border-top: 1px solid var(--background-modifier-border-hover);
+}
+
+.mdbase-activity-row > span:first-child { color: var(--text-muted); }
+.mdbase-activity-row[data-tone="success"] > span:first-child { color: var(--text-success); }
+.mdbase-activity-row[data-tone="attention"] > span:first-child { color: var(--text-warning); }
+.mdbase-activity-row[data-tone="error"] > span:first-child { color: var(--text-error); }
+.mdbase-activity-row svg { width: 16px; height: 16px; }
+.mdbase-activity-row strong { display: block; }
+.mdbase-activity-row > div > div { margin: 2px 0; color: var(--text-muted); }
+
+.mdbase-conflict-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.mdbase-conflict-summary { min-width: 0; }
+.mdbase-conflict-comparison { grid-column: 1 / -1; margin-top: 12px; }
+
+.mdbase-conflict-legend {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.mdbase-conflict-legend .is-local { color: var(--text-error); }
+.mdbase-conflict-legend .is-remote { color: var(--text-success); }
+
+.mdbase-conflict-diff {
+  max-height: 360px;
+  margin: 0;
+  padding: 8px 0;
+  overflow: auto;
+  background: var(--code-background);
+  font-size: var(--font-ui-smaller);
+}
+
+.mdbase-conflict-diff > div { display: grid; grid-template-columns: 24px minmax(max-content, 1fr); padding: 0 10px; }
+.mdbase-conflict-diff > .is-local { background: rgba(var(--color-red-rgb), .12); }
+.mdbase-conflict-diff > .is-remote { background: rgba(var(--color-green-rgb), .12); }
+
+.mdbase-conflict-sides {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.mdbase-conflict-side {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.mdbase-conflict-side h4 { margin: 0 0 8px; }
+.mdbase-conflict-side code,
+.mdbase-conflict-digest { overflow-wrap: anywhere; }
+.mdbase-conflict-side > div { margin-top: 5px; color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.mdbase-conflict-image-preview { display: block; max-width: 100%; max-height: 240px; margin-top: 10px; object-fit: contain; }
 
 .mdbase-transfer-body div,
 .mdbase-transfer-empty,
@@ -1854,6 +1966,9 @@ button.mdbase-issue-file-button:hover {
     align-items: stretch;
     flex-direction: column;
   }
+
+  .mdbase-conflict-sides { grid-template-columns: 1fr; }
+  .mdbase-recovery-card { grid-template-columns: 1fr; }
 
   .mdbase-status-row {
     grid-template-columns: 110px minmax(0, 1fr);

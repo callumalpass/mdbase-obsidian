@@ -151,8 +151,9 @@ test("resolved conflict cleanup is projected without inventing a transfer", () =
     path: "images/resolved.png",
     direction: "attention",
     action: "fix",
-    detail: "Local and hosted file content now matches; clear the resolved conflict.",
-    fileId: "file-1",
+      detail: "Local and hosted file content now matches; clear the resolved conflict.",
+      estimatedBytes: 12,
+      fileId: "file-1",
   }]);
   assert.equal(preview.download_files, 0);
   assert.equal(preview.upload_files, 0);

@@ -13,6 +13,7 @@ export interface SyncPreviewEntry {
   direction: SyncPreviewDirection;
   action: SyncPreviewAction;
   detail: string;
+  estimatedBytes?: number;
   recordId?: string;
   fileId?: string;
 }
@@ -88,6 +89,7 @@ function actionEntry(action: MirrorPlanAction): SyncPreviewEntry {
       direction: "attention",
       action: "fix",
       detail: `Local and hosted ${action.entity} changes conflict (${action.conflict_kind.replace(/_/g, " ")}).`,
+      ...(object?.entity === "file" && object.size !== undefined ? { estimatedBytes: object.size } : {}),
       ...(action.entity === "record" ? { recordId: action.identity } : { fileId: action.identity }),
     };
   }
@@ -103,6 +105,7 @@ function actionEntry(action: MirrorPlanAction): SyncPreviewEntry {
       direction: "attention",
       action: "fix",
       detail: `Local and hosted ${action.entity} content now matches; clear the resolved conflict.`,
+      ...(object?.entity === "file" && object.size !== undefined ? { estimatedBytes: object.size } : {}),
       ...(action.entity === "record" ? { recordId: action.identity } : { fileId: action.identity }),
     };
   }
@@ -128,6 +131,7 @@ function actionEntry(action: MirrorPlanAction): SyncPreviewEntry {
     direction: localCommand ? "download" : "upload",
     action: verb,
     detail: `${localCommand ? "Hosted" : "Local"} ${object.entity} will ${operation}${movement}.`,
+    ...(object.entity === "file" && object.size !== undefined ? { estimatedBytes: object.size } : {}),
     ...(object.entity === "record" ? { recordId: object.identity } : {}),
     ...(object.entity === "file" ? { fileId: object.identity } : {}),
   };

@@ -103,7 +103,26 @@ class MemoryVault {
       this.files.set(normalized, { file: existing, content });
     },
     remove: async (path: string): Promise<void> => {
-      this.files.delete(normalizePath(path));
+      const normalized = normalizePath(path);
+      this.files.delete(normalized);
+      this.binaryFiles.delete(normalized);
+    },
+    copy: async (source: string, target: string): Promise<void> => {
+      const sourcePath = normalizePath(source);
+      const targetPath = normalizePath(target);
+      const text = this.files.get(sourcePath);
+      if (text) {
+        const file = new TestFile(targetPath);
+        this.files.set(targetPath, { file, content: text.content });
+        return;
+      }
+      const binary = this.binaryFiles.get(sourcePath);
+      if (binary) {
+        const file = new TestFile(targetPath);
+        this.binaryFiles.set(targetPath, { file, content: binary.content.slice(0) });
+        return;
+      }
+      throw new Error(`missing ${source}`);
     },
   };
 
@@ -1071,6 +1090,15 @@ test("Connect controller previews the exact first transfer and later local edits
     transportFactory: () => hosted.transport(replicaId),
   });
 
+  const [concurrentStatus, duplicateStatus, concurrentPreview] = await Promise.all([
+    controller.status(),
+    controller.status(),
+    controller.preview(),
+  ]);
+  assert.equal(concurrentStatus?.state, "not_initialized");
+  assert.equal(duplicateStatus?.state, "not_initialized");
+  assert.equal(concurrentPreview.phase, "initial");
+
   const first = await controller.preview();
   assert.equal(first.phase, "initial");
   assert.deepEqual(first.entries.map((entry) => [entry.direction, entry.action, entry.path]), [
@@ -1084,6 +1112,108 @@ test("Connect controller previews the exact first transfer and later local edits
   assert.deepEqual(incremental.entries.map((entry) => [entry.direction, entry.action, entry.path]), [
     ["upload", "update", "notes/one.md"],
   ]);
+});
+
+test("disconnect removes only checkpoint-exact files and preserves local changes", async () => {
+  let failProfileSave = false;
+  const hosted = new MemoryAuthority();
+  hosted.seed([
+    { record_id: "exact", path: "notes/exact.md", frontmatter: { title: "Exact" }, body: "Hosted exact", types: [] },
+    { record_id: "changed", path: "notes/changed.md", frontmatter: { title: "Changed" }, body: "Hosted original", types: [] },
+  ]);
+  const replicaId = hosted.registerReplica({ name: "Disposable", mode: "read_write" });
+  const session = await hosted.transport(replicaId).openSession();
+  const vault = new MemoryVault();
+  await vault.createFolder(".mdbase");
+  await vault.create(".mdbase/connect-role.json", `${JSON.stringify({
+    version: 1,
+    role: "mirror",
+    collection_id: session.collection_id,
+  })}\n`);
+  const state = new MemoryMirrorStateStore();
+  let profile: import("../src/connectSync").MirrorProfile | null = {
+    version: 1,
+    syncUrl: `https://sync.example/v1/authorities/${session.collection_id}/sync`,
+    controlUrl: "https://connect.example",
+    collectionId: session.collection_id,
+    replicaId,
+    mode: "read_write",
+    name: "Disposable",
+    enrollmentId: "11111111-1111-4111-8111-111111111111",
+    accessTokenExpiresAt: "2099-01-01T00:00:00.000Z",
+  };
+  const secrets = new Map<string, string>();
+  const controller = new ConnectSyncController({
+    vault,
+    secretStorage: {
+      setSecret: (key: string, value: string) => { secrets.set(key, value); },
+      getSecret: () => "access-token",
+      listSecrets: () => [],
+    },
+  } as never, {
+    getMirrorProfile: () => profile,
+    saveMirrorProfile: async (next) => {
+      if (failProfileSave) throw new Error("injected profile save failure");
+      profile = next;
+    },
+  }, {
+    stateStoreFactory: () => state,
+    blobStoreFactory: () => new MemoryMirrorBlobStore(),
+    fileSystem: new ObsidianMirrorFileSystem(vault as never),
+    transportFactory: () => hosted.transport(replicaId),
+  });
+  const initial = await controller.preview();
+  await controller.sync(initial);
+  failProfileSave = true;
+  await assert.rejects(controller.disconnect(true), /injected profile save failure/);
+  assert.ok(vault.read("notes/exact.md"));
+  assert.ok(vault.read("notes/changed.md"));
+  assert.ok(vault.read(".mdbase/connect-role.json"));
+  assert.ok(profile);
+  failProfileSave = false;
+  const changed = vault.getAbstractFileByPath("notes/changed.md") as TFile;
+  await vault.modify(changed, `${vault.read(changed.path)}Local edit after checkpoint\n`);
+
+  const result = await controller.disconnect(true);
+
+  assert.deepEqual(result.removed, ["notes/exact.md"]);
+  assert.deepEqual(result.preserved, ["notes/changed.md"]);
+  assert.equal(vault.read("notes/exact.md"), null);
+  assert.match(vault.read("notes/changed.md") ?? "", /Local edit after checkpoint/);
+  assert.equal(vault.read(".mdbase/connect-role.json"), null);
+  assert.equal(profile, null);
+  assert.ok([...secrets.values()].every((value) => value === ""));
+});
+
+test("conflict copy uses a collision-safe sibling without changing the original", async () => {
+  const vault = new MemoryVault();
+  await vault.createFolder("notes");
+  await vault.create("notes/conflict.md", "local version\n");
+  await vault.create("notes/conflict (local conflict copy).md", "older copy\n");
+  const profile = {
+    version: 1 as const,
+    syncUrl: "https://sync.example/v1/authorities/collection/sync",
+    controlUrl: "https://connect.example",
+    collectionId: "collection",
+    replicaId: "replica",
+    mode: "read_write" as const,
+    name: "Conflict",
+    enrollmentId: "enrollment",
+    accessTokenExpiresAt: "2099-01-01T00:00:00.000Z",
+  };
+  const controller = new ConnectSyncController({
+    vault,
+    secretStorage: { setSecret: () => undefined, getSecret: () => "token", listSecrets: () => [] },
+  } as never, {
+    getMirrorProfile: () => profile,
+    saveMirrorProfile: async () => undefined,
+  }, { fileSystem: new ObsidianMirrorFileSystem(vault as never) });
+
+  const copied = await controller.preserveConflictCopy("notes/conflict.md");
+
+  assert.equal(copied, "notes/conflict (local conflict copy 2).md");
+  assert.equal(vault.read(copied), "local version\n");
+  assert.equal(vault.read("notes/conflict.md"), "local version\n");
 });
 
 test("writable mirror uploads local edits and collision preflight makes no writes", async () => {

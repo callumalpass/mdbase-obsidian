@@ -79,6 +79,7 @@ import {
   type MdbaseSyncPreview,
   previewFromPlan,
 } from "./syncPreview";
+import type { FileTransferProgress } from "./syncUx";
 
 export interface MirrorProfile {
   version: 1;
@@ -105,6 +106,29 @@ export interface EnrollMirrorCallbacks {
   onVerification(verification: MirrorEnrollmentVerification): void | Promise<void>;
   onStatus?(status: MirrorEnrollmentStatus): void;
   signal?: AbortSignal;
+}
+
+export interface MirrorConflictSide {
+  state: "absent" | "exact";
+  path?: string;
+  revision?: string;
+  size?: number;
+  modifiedAt?: string;
+  document?: string;
+  resourceUrl?: string;
+}
+
+export interface MirrorConflictComparison {
+  entity: "record" | "file";
+  objectId: string;
+  decisionId: string;
+  local: MirrorConflictSide;
+  remote: MirrorConflictSide;
+}
+
+export interface DisconnectMirrorResult {
+  removed: string[];
+  preserved: string[];
 }
 
 export interface AdoptLocalCollectionInput {
@@ -427,6 +451,7 @@ implements SyncTransport<Frontmatter> {
     syncUrl: string,
     private readonly accessToken: string,
     private readonly send: (request: RequestUrlParam) => Promise<RequestUrlResponse> = resilientRequestUrl,
+    private readonly onFileProgress?: (progress: FileTransferProgress) => void,
   ) {
     let endpoint: URL;
     try {
@@ -473,6 +498,8 @@ implements SyncTransport<Frontmatter> {
   async *downloadFile(file: CollectionFileDescriptor): AsyncGenerator<Uint8Array> {
     const transferId = crypto.randomUUID();
     try {
+      let transferredBytes = 0;
+      this.onFileProgress?.({ direction: "download", path: file.path, transferredBytes, totalBytes: file.size });
       const session = await this.fileRequest<FileTransferSession>("POST", "downloads", {
         protocol_version: 1,
         type: "open_file_download",
@@ -507,6 +534,8 @@ implements SyncTransport<Frontmatter> {
         if ((declared !== undefined && Number(declared) !== expected) || response.arrayBuffer.byteLength !== expected) {
           throw new SyncError("file_integrity_failed", "Hosted authority returned a file part with the wrong length.");
         }
+        transferredBytes += expected;
+        this.onFileProgress?.({ direction: "download", path: file.path, transferredBytes, totalBytes: file.size });
         if (expected) yield new Uint8Array(response.arrayBuffer);
       }
     } finally {
@@ -551,6 +580,11 @@ implements SyncTransport<Frontmatter> {
           || uploadedParts.some((part, index) => part.part_number - 1 !== session.received[index])
         : uploadedParts.length !== 0)
     ) throw new SyncError("invalid_sync_response", "Authority returned invalid uploaded part receipts.");
+    let transferredBytes = session.received.reduce((total, index) => {
+      const offset = index * partSize;
+      return total + Math.min(partSize, Math.max(0, request.size - offset));
+    }, 0);
+    this.onFileProgress?.({ direction: "upload", path: request.path, transferredBytes, totalBytes: request.size });
     if (session.received.length === count) return this.commitUpload(request.transfer_id, uploadedParts);
     const received = new Set(session.received);
     const parts = Array.from({ length: count }, () => undefined as { part_number: number; etag: string } | undefined);
@@ -582,6 +616,8 @@ implements SyncTransport<Frontmatter> {
       if (response.status < 200 || response.status >= 300) {
         throw new SyncError("file_upload_failed", `Object storage returned HTTP ${response.status}.`);
       }
+      transferredBytes += length;
+      this.onFileProgress?.({ direction: "upload", path: request.path, transferredBytes, totalBytes: request.size });
       if (session.strategy.kind === "object_multipart") {
         const etag = headerValue(response.headers, "etag");
         if (!etag) throw new SyncError("invalid_sync_response", "Object storage omitted a multipart ETag.");
@@ -1114,6 +1150,17 @@ export class IndexedDbMirrorStateStore implements MirrorStateStore {
     });
   }
 
+  async clear(): Promise<void> {
+    const database = await this.open();
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(STATE_STORE, "readwrite");
+      transaction.objectStore(STATE_STORE).delete(this.key);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+  }
+
   private open(): Promise<IDBDatabase> {
     if (typeof indexedDB === "undefined") {
       throw new SyncError("storage_unavailable", "IndexedDB is required for persistent mirror state.");
@@ -1166,7 +1213,10 @@ export interface ConnectSyncControllerOptions {
 
 export class ConnectSyncController {
   private progress: MirrorProgress | null = null;
+  private fileProgress: FileTransferProgress | null = null;
   private syncAbort: AbortController | null = null;
+  private statusRequest: Promise<MirrorStatus | null> | null = null;
+  private mirrorOperationTail: Promise<void> = Promise.resolve();
   private readonly fileSystem: MirrorFileSystem;
   private readonly enrollmentClient: MirrorEnrollmentClient;
   private readonly adoptionClient: AuthorityAdoptionClient;
@@ -1198,6 +1248,10 @@ export class ConnectSyncController {
 
   getProgress(): MirrorProgress | null {
     return this.progress ? { ...this.progress } : null;
+  }
+
+  getFileProgress(): FileTransferProgress | null {
+    return this.fileProgress ? { ...this.fileProgress } : null;
   }
 
   getAdoptionMarker(): Readonly<AdoptionMarker> | null {
@@ -1335,23 +1389,222 @@ export class ConnectSyncController {
   }
 
   async preview(): Promise<MdbaseSyncPreview> {
-    const profile = this.requireProfile();
-    await this.assertMirror(profile.collectionId);
-    const mirror = await this.createMirror();
-    return previewFromPlan(await mirror.inspect());
+    return this.withMirrorOperation(async () => {
+      const profile = this.requireProfile();
+      await this.assertMirror(profile.collectionId);
+      const mirror = await this.createMirror();
+      return previewFromPlan(await mirror.inspect());
+    });
   }
 
   async status(): Promise<MirrorStatus | null> {
-    const profile = this.settingsHost.getMirrorProfile();
-    if (!profile) return null;
-    await this.assertMirror(profile.collectionId);
-    const mirror = await this.createMirror();
-    return mirror.status();
+    if (this.statusRequest) return this.statusRequest;
+    const request = this.readStatus();
+    this.statusRequest = request;
+    try {
+      return await request;
+    } finally {
+      if (this.statusRequest === request) this.statusRequest = null;
+    }
+  }
+
+  private async readStatus(): Promise<MirrorStatus | null> {
+    return this.withMirrorOperation(async () => {
+      const profile = this.settingsHost.getMirrorProfile();
+      if (!profile) return null;
+      await this.assertMirror(profile.collectionId);
+      const mirror = await this.createMirror();
+      return mirror.status();
+    });
+  }
+
+  async reconnect(): Promise<MirrorStatus> {
+    const profile = this.requireProfile();
+    const refreshCredential = this.app.secretStorage.getSecret(this.refreshSecretId(profile.collectionId));
+    if (!refreshCredential) {
+      throw new SyncError("mirror_credentials_missing", "The mirror refresh credential is missing. Approve this vault again.");
+    }
+    const renewed = await this.enrollmentClient.renew({
+      controlUrl: profile.controlUrl,
+      syncUrl: profile.syncUrl,
+      collectionId: profile.collectionId,
+      replicaId: profile.replicaId,
+      mode: profile.mode,
+      name: profile.name,
+      enrollmentId: profile.enrollmentId,
+      accessToken: this.app.secretStorage.getSecret(this.accessSecretId(profile.collectionId)) ?? "",
+      refreshCredential,
+      accessTokenExpiresAt: profile.accessTokenExpiresAt,
+    });
+    await this.persistEnrollment(renewed, profile.selectiveSync);
+    return (await this.status())!;
+  }
+
+  async reauthorize(callbacks: EnrollMirrorCallbacks): Promise<MirrorStatus> {
+    const profile = this.requireProfile();
+    const oldStore = this.stateStoreFor(profile);
+    const oldState = await oldStore.read();
+    if (oldState?.batch) {
+      throw new SyncError(
+        "mirror_recovery_required",
+        "Resume the durable synchronization checkpoint before approving this vault again.",
+      );
+    }
+    const enrollment = await this.enrollmentClient.enroll({
+      controlUrl: profile.controlUrl,
+      mirrorName: profile.name,
+      mode: profile.mode,
+      collectionId: profile.collectionId,
+    }, callbacks);
+    if (enrollment.collectionId !== profile.collectionId) {
+      throw new SyncError("mirror_identity_conflict", "Connect approved a different collection. The existing mirror was not changed.");
+    }
+    const nextProfile = profileFromEnrollment(enrollment, profile.selectiveSync);
+    if (oldState && enrollment.replicaId !== profile.replicaId) {
+      await this.stateStoreFor(nextProfile).write({
+        ...oldState,
+        replica_id: enrollment.replicaId,
+      });
+    }
+    await this.persistEnrollment(enrollment, profile.selectiveSync);
+    if (enrollment.replicaId !== profile.replicaId && "clear" in oldStore && typeof oldStore.clear === "function") {
+      await oldStore.clear();
+    }
+    return (await this.status())!;
+  }
+
+  async conflictComparison(
+    conflict: MirrorStatus["conflicts"][number],
+  ): Promise<MirrorConflictComparison> {
+    const profile = this.requireProfile();
+    const transport = await this.transportFor(profile);
+    const session = await transport.openSession();
+    let remote: MirrorConflictSide = { state: "absent" };
+    if (conflict.entity === "record") {
+      let page: string | undefined;
+      do {
+        const snapshot = await transport.snapshot(session.snapshot_id, page);
+        const record = snapshot.records.find((candidate) => candidate.record_id === conflict.object_id);
+        if (record) {
+          remote = {
+            state: "exact",
+            path: record.path,
+            revision: record.revision,
+            size: new TextEncoder().encode(record.document).byteLength,
+            document: record.document,
+          };
+          break;
+        }
+        page = snapshot.next_page;
+      } while (page);
+    } else {
+      let page: string | undefined;
+      do {
+        const snapshot = await transport.fileSnapshot(session.snapshot_id, page);
+        const file = snapshot.files.find((candidate) => candidate.file_id === conflict.object_id);
+        if (file) {
+          remote = {
+            state: "exact",
+            path: file.path,
+            revision: file.content_digest,
+            size: file.size,
+            modifiedAt: file.modified_at,
+          };
+          break;
+        }
+        page = snapshot.next_page;
+      } while (page);
+    }
+    const path = conflict.path ?? remote.path;
+    let local: MirrorConflictSide = { state: "absent" };
+    if (path) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (file instanceof TFile) {
+        if (conflict.entity === "record") {
+          const document = await this.app.vault.cachedRead(file);
+          local = {
+            state: "exact",
+            path,
+            size: new TextEncoder().encode(document).byteLength,
+            modifiedAt: file.stat?.mtime ? new Date(file.stat.mtime).toISOString() : undefined,
+            document,
+          };
+        } else {
+          const info = await this.fileSystem.inspectBinary(path);
+          if (info) {
+            local = {
+              state: "exact",
+              path,
+              revision: info.content_digest,
+              size: info.size,
+              modifiedAt: file.stat?.mtime ? new Date(file.stat.mtime).toISOString() : undefined,
+              resourceUrl: this.app.vault.getResourcePath(file),
+            };
+          }
+        }
+      }
+    }
+    const current = await this.status();
+    if (!current?.conflicts.some((candidate) => candidate.object_id === conflict.object_id && candidate.decision_id === conflict.decision_id)) {
+      throw new SyncError("conflict_decision_stale", "This file changed again while its versions were loading.");
+    }
+    return {
+      entity: conflict.entity,
+      objectId: conflict.object_id,
+      decisionId: conflict.decision_id,
+      local,
+      remote,
+    };
+  }
+
+  async preserveConflictCopy(pathInput: string): Promise<string> {
+    const path = safeMirrorPath(pathInput);
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (!(existing instanceof TFile)) throw new SyncError("mirror_conflict_copy_missing", `No local file exists at ${path}.`);
+    const extension = existing.extension ? `.${existing.extension}` : "";
+    const base = extension ? path.slice(0, -extension.length) : path;
+    let target = `${base} (local conflict copy)${extension}`;
+    let suffix = 2;
+    while (this.app.vault.getAbstractFileByPath(target) || await this.app.vault.adapter.exists(target)) {
+      target = `${base} (local conflict copy ${suffix})${extension}`;
+      suffix += 1;
+    }
+    await this.app.vault.adapter.copy(path, target);
+    return target;
+  }
+
+  async disconnect(removeSyncedFiles: boolean): Promise<DisconnectMirrorResult> {
+    if (this.isSyncing()) throw new SyncError("mirror_busy", "Stop the current synchronization before disconnecting.");
+    const profile = this.requireProfile();
+    const stateStore = this.stateStoreFor(profile);
+    const state = await stateStore.read();
+    if (state?.batch) {
+      throw new SyncError("mirror_recovery_required", "Resume the durable synchronization checkpoint before disconnecting.");
+    }
+    const result: DisconnectMirrorResult = { removed: [], preserved: [] };
+    const marker = await this.readMarker();
+    if (marker) await this.app.vault.adapter.remove(ROLE_MARKER_PATH);
+    try {
+      await this.settingsHost.saveMirrorProfile(null);
+    } catch (error) {
+      if (marker) await this.markMirror(profile.collectionId);
+      throw error;
+    }
+    this.app.secretStorage.setSecret(this.accessSecretId(profile.collectionId), "");
+    this.app.secretStorage.setSecret(this.refreshSecretId(profile.collectionId), "");
+    if ("clear" in stateStore && typeof stateStore.clear === "function") await stateStore.clear();
+    await this.blobStoreFor(profile).prune(new Set());
+    // Destructive file removal starts only after the authority connection is
+    // durably gone, so a settings failure can never leave a live mirror with a
+    // partially deleted local collection.
+    if (removeSyncedFiles && state) await this.removeExactMirrorFiles(state, result);
+    return result;
   }
 
   async sync(
     reviewed: MdbaseSyncPreview,
     onProgress?: (progress: MirrorProgress) => void,
+    onFileProgress?: (progress: FileTransferProgress) => void,
   ): Promise<MirrorApplyResult> {
     if (this.syncAbort) {
       throw new SyncError("mirror_busy", "Synchronization is already running for this vault.");
@@ -1359,16 +1612,23 @@ export class ConnectSyncController {
     const abort = new AbortController();
     this.syncAbort = abort;
     try {
-      const mirror = await this.createMirror((next) => {
+      return await this.withMirrorOperation(async () => {
+        const mirror = await this.createMirror((next) => {
+          abortIfNeeded(abort.signal);
+          this.progress = next;
+          onProgress?.({ ...next });
+        }, abort.signal, (next) => {
+          abortIfNeeded(abort.signal);
+          this.fileProgress = next;
+          onFileProgress?.({ ...next });
+        });
+        const outcome = await mirror.apply(reviewed.plan, { signal: abort.signal });
         abortIfNeeded(abort.signal);
-        this.progress = next;
-        onProgress?.({ ...next });
-      }, abort.signal);
-      const outcome = await mirror.apply(reviewed.plan, { signal: abort.signal });
-      abortIfNeeded(abort.signal);
-      return outcome;
+        return outcome;
+      });
     } finally {
       this.progress = null;
+      this.fileProgress = null;
       this.syncAbort = null;
     }
   }
@@ -1386,9 +1646,23 @@ export class ConnectSyncController {
     decisionId: string,
     resolution: "local" | "remote",
   ): Promise<MirrorStatus> {
-    const mirror = await this.createMirror();
-    await mirror.resolveConflict(objectId, decisionId, resolution);
-    return mirror.status();
+    return this.withMirrorOperation(async () => {
+      const mirror = await this.createMirror();
+      await mirror.resolveConflict(objectId, decisionId, resolution);
+      return mirror.status();
+    });
+  }
+
+  private async withMirrorOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const predecessor = this.mirrorOperationTail;
+    let release!: () => void;
+    this.mirrorOperationTail = new Promise<void>((resolve) => { release = resolve; });
+    await predecessor;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   private async runAdoption(
@@ -1705,20 +1979,22 @@ export class ConnectSyncController {
   private async transportFor(
     profile: MirrorProfile,
     signal?: AbortSignal,
+    onFileProgress?: (progress: FileTransferProgress) => void,
   ): Promise<SyncTransport<JsonObject>> {
     const accessToken = await this.freshAccessToken(profile);
     const transport = this.options.transportFactory?.(profile, accessToken)
-      ?? new ObsidianSyncTransport(profile.syncUrl, accessToken);
+      ?? new ObsidianSyncTransport(profile.syncUrl, accessToken, resilientRequestUrl, onFileProgress);
     return abortableSyncTransport(transport, signal);
   }
 
   private async createMirror(
     onProgress?: (progress: MirrorProgress) => void,
     signal?: AbortSignal,
+    onFileProgress?: (progress: FileTransferProgress) => void,
   ): Promise<DirectoryMirror<JsonObject>> {
     const profile = this.requireProfile();
     await this.assertMirror(profile.collectionId);
-    const transport = await this.transportFor(profile, signal);
+    const transport = await this.transportFor(profile, signal, onFileProgress);
     const mirrorOptions: DirectoryMirrorOptions = {
       stateStore: this.stateStoreFor(profile),
       fileSystem: this.fileSystem,
@@ -1758,18 +2034,55 @@ export class ConnectSyncController {
   private async persistEnrollment(enrollment: MirrorEnrollment, selectiveSync?: SelectiveSyncPolicy): Promise<void> {
     this.app.secretStorage.setSecret(this.accessSecretId(enrollment.collectionId), enrollment.accessToken);
     this.app.secretStorage.setSecret(this.refreshSecretId(enrollment.collectionId), enrollment.refreshCredential);
-    await this.settingsHost.saveMirrorProfile({
-      version: 1,
-      syncUrl: enrollment.syncUrl,
-      controlUrl: enrollment.controlUrl,
-      collectionId: enrollment.collectionId,
-      replicaId: enrollment.replicaId,
-      mode: enrollment.mode,
-      name: enrollment.name,
-      enrollmentId: enrollment.enrollmentId,
-      accessTokenExpiresAt: enrollment.accessTokenExpiresAt,
-      selectiveSync: normalizeSelectiveSync(selectiveSync ?? this.settingsHost.getMirrorProfile()?.selectiveSync),
-    });
+    await this.settingsHost.saveMirrorProfile(profileFromEnrollment(
+      enrollment,
+      selectiveSync ?? this.settingsHost.getMirrorProfile()?.selectiveSync,
+    ));
+  }
+
+  private async removeExactMirrorFiles(state: MirrorState, result: DisconnectMirrorResult): Promise<void> {
+    const paths = new Map<string, { entity: "document" | "file"; document?: string; revision?: string; digest?: string; size?: number }>();
+    for (const [identity, entry] of Object.entries(state.records)) {
+      const path = state.local_bindings?.[identity]?.path ?? entry.path;
+      paths.set(path, { entity: "document", document: entry.record?.document, revision: entry.revision });
+    }
+    for (const [identity, entry] of Object.entries(state.resources ?? {})) {
+      const path = state.local_bindings?.[identity]?.path ?? entry.path;
+      paths.set(path, { entity: "document", document: entry.record?.document, revision: entry.revision });
+    }
+    for (const [identity, entry] of Object.entries(state.files ?? {})) {
+      const path = state.local_bindings?.[identity]?.path ?? entry.file.path;
+      paths.set(path, {
+        entity: "file",
+        digest: entry.file.content_digest,
+        size: entry.file.size,
+      });
+    }
+    for (const [path, expected] of [...paths.entries()].sort(([left], [right]) => right.localeCompare(left))) {
+      let exact = false;
+      if (expected.entity === "document") {
+        const current = await this.fileSystem.read(path);
+        exact = current !== null && (expected.document !== undefined
+          ? current === expected.document
+          : await documentHasRevision(current, expected.revision));
+      } else if (expected.entity === "file") {
+        const current = await this.fileSystem.inspectBinary(path);
+        exact = current !== null && current.content_digest === expected.digest && current.size === expected.size;
+      }
+      if (!exact) {
+        if (await this.fileSystem.exists(path)) result.preserved.push(path);
+        continue;
+      }
+      try {
+        await this.fileSystem.remove(path);
+        result.removed.push(path);
+      } catch {
+        // A file that Obsidian or the OS cannot remove remains local. The
+        // connection is already gone, so it cannot be mistaken for a remote
+        // deletion on a later sync.
+        result.preserved.push(path);
+      }
+    }
   }
 
   private async freshAccessToken(profile: MirrorProfile): Promise<string> {
@@ -2106,4 +2419,29 @@ function validSelectiveSync(value: unknown): value is SelectiveSyncPolicy {
   } catch {
     return false;
   }
+}
+
+function profileFromEnrollment(
+  enrollment: MirrorEnrollment,
+  selectiveSync?: SelectiveSyncPolicy,
+): MirrorProfile {
+  return {
+    version: 1,
+    syncUrl: enrollment.syncUrl,
+    controlUrl: enrollment.controlUrl,
+    collectionId: enrollment.collectionId,
+    replicaId: enrollment.replicaId,
+    mode: enrollment.mode,
+    name: enrollment.name,
+    enrollmentId: enrollment.enrollmentId,
+    accessTokenExpiresAt: enrollment.accessTokenExpiresAt,
+    selectiveSync: normalizeSelectiveSync(selectiveSync),
+  };
+}
+
+async function documentHasRevision(document: string, revision?: string): Promise<boolean> {
+  if (!revision?.startsWith("sha256:")) return false;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(document)));
+  const actual = `sha256:${Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  return actual === revision;
 }

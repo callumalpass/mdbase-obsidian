@@ -4,11 +4,11 @@ import { readFile } from "node:fs/promises";
 const bundle = await readFile(new URL("../main.js", import.meta.url));
 const source = bundle.toString("utf8");
 const gzipBytes = gzipSync(bundle).byteLength;
-// beta.68 includes the complete digest-verified collection-file data plane and
-// engine-owned sync plans. Keep a narrow margin over its measured production
-// bundle so later growth is visible.
-const rawBudget = 640 * 1024;
-const gzipBudget = 185 * 1024;
+// The sync-polish baseline includes conflict inspection, transfer telemetry,
+// recovery actions, and a bounded activity ledger. Keep a narrow margin over
+// that reviewed production bundle so unintentional dependency growth is visible.
+const rawBudget = 680 * 1024;
+const gzipBudget = 195 * 1024;
 const forbidden = [
   /require\((["'])node:(?:fs|path|crypto|os|worker_threads|child_process)\1\)/,
   /require\((["'])(?:fs|path|crypto|os|worker_threads|child_process)\1\)/,

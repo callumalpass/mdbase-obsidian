@@ -104,6 +104,7 @@ test("Obsidian HTTP transport downloads bounded binary parts and cleans up the t
   const file = descriptor("Media/download.png", bytes);
   let transferId = "";
   let cleaned = false;
+  const progress: Array<{ transferredBytes: number; totalBytes: number; path: string }> = [];
   const send = async (request: { url: string; method?: string; body?: string | ArrayBuffer; headers?: Record<string, string> }) => {
     if (request.url.endsWith("/files/downloads")) {
       transferId = JSON.parse(String(request.body)).transfer_id as string;
@@ -131,9 +132,14 @@ test("Obsidian HTTP transport downloads bounded binary parts and cleans up the t
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   };
-  const transport = new ObsidianSyncTransport(syncUrl, "secret-token", send as never);
+  const transport = new ObsidianSyncTransport(syncUrl, "secret-token", send as never, (event) => progress.push(event));
   assert.deepEqual(await collect(transport.downloadFile(file)), bytes);
   assert.equal(cleaned, true);
+  assert.deepEqual(progress.map(({ transferredBytes, totalBytes, path }) => ({ transferredBytes, totalBytes, path })), [
+    { transferredBytes: 0, totalBytes: 6, path: "Media/download.png" },
+    { transferredBytes: 4, totalBytes: 6, path: "Media/download.png" },
+    { transferredBytes: 6, totalBytes: 6, path: "Media/download.png" },
+  ]);
 });
 
 test("Obsidian HTTP transport uploads exact multipart bytes without forwarding credentials", async () => {
@@ -142,6 +148,7 @@ test("Obsidian HTTP transport uploads exact multipart bytes without forwarding c
   const transferId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const uploaded: Uint8Array[] = [];
   const objectHeaders: Record<string, string>[] = [];
+  const progress: Array<{ transferredBytes: number; totalBytes: number; path: string }> = [];
   const send = async (request: { url: string; method?: string; body?: string | ArrayBuffer; headers?: Record<string, string> }) => {
     if (request.url.endsWith("/files/uploads")) {
       return response(200, {
@@ -198,7 +205,7 @@ test("Obsidian HTTP transport uploads exact multipart bytes without forwarding c
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   };
-  const transport = new ObsidianSyncTransport(syncUrl, "secret-token", send as never);
+  const transport = new ObsidianSyncTransport(syncUrl, "secret-token", send as never, (event) => progress.push(event));
   const receipt = await transport.uploadFile({
     protocol_version: 1,
     type: "open_file_upload",
@@ -217,5 +224,10 @@ test("Obsidian HTTP transport uploads exact multipart bytes without forwarding c
   assert.deepEqual(objectHeaders, [
     { "x-object-token": "part-0" },
     { "x-object-token": "part-1" },
+  ]);
+  assert.deepEqual(progress.map(({ transferredBytes, totalBytes, path }) => ({ transferredBytes, totalBytes, path })), [
+    { transferredBytes: 0, totalBytes: 5, path: "Media/upload.png" },
+    { transferredBytes: 3, totalBytes: 5, path: "Media/upload.png" },
+    { transferredBytes: 5, totalBytes: 5, path: "Media/upload.png" },
   ]);
 });
