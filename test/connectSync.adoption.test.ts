@@ -396,6 +396,7 @@ test("adopts every canonical resource and retains the existing vault as a mirror
 test("adoption includes selected binary files and supplies their exact bytes", async () => {
   const { vault, adoption, controller } = await fixture();
   const bytes = Uint8Array.from([0, 4, 8, 15, 16, 23, 42, 255]);
+  await vault.putBinary("Attachments/empty.png", new Uint8Array());
   await vault.putBinary("Attachments/evidence.png", bytes);
   await vault.putBinary("Attachments/unselected.pdf", Uint8Array.of(9, 9, 9));
   await controller.adoptLocalCollection({
@@ -405,9 +406,10 @@ test("adoption includes selected binary files and supplies their exact bytes", a
   }, callbacks);
   const final = adoption.uploads.at(-1)!;
   assert.deepEqual(final.files.map((file) => [file.path, file.media_class, file.size]), [
+    ["Attachments/empty.png", "image", 0],
     ["Attachments/evidence.png", "image", bytes.byteLength],
   ]);
-  assert.deepEqual(adoption.uploadedFileBytes.at(-1), [bytes]);
+  assert.deepEqual(adoption.uploadedFileBytes.at(-1), [new Uint8Array(), bytes]);
 });
 
 test("adoption snapshot cancellation stops before hashing the next heavy file", async () => {
