@@ -1,4 +1,5 @@
 import { normalizePath, parseYaml, stringifyYaml, TFile, Vault } from "obsidian";
+import type { CollectionContractDescriptor } from "@mdbase-dev/connect-protocol";
 import type { ErrorObject } from "ajv";
 import { Ajv2020 } from "ajv/dist/2020";
 import addFormatsImport from "ajv-formats";
@@ -20,6 +21,7 @@ export interface MdbaseIssue {
 
 export interface MdbaseSettings {
   types_folder: string;
+  contracts_folder?: string;
   explicit_type_keys: string[];
   default_strict: boolean;
   include_subfolders: boolean;
@@ -114,6 +116,7 @@ const DEFAULT_CONFIG: MdbaseConfig = {
   description: "Typed markdown collection",
   settings: {
     types_folder: "_types",
+    contracts_folder: "_contracts",
     explicit_type_keys: ["type", "types"],
     default_strict: false,
     include_subfolders: true,
@@ -701,6 +704,48 @@ export async function loadTypeDefinitions(vault: Vault, config: MdbaseConfig): P
   }
 
   return resolveTypeInheritance(rawTypeMap);
+}
+
+export async function loadContractDefinitions(
+  vault: Vault,
+  config: MdbaseConfig,
+): Promise<Map<string, CollectionContractDescriptor>> {
+  const contracts = new Map<string, CollectionContractDescriptor>();
+  const folderPrefix = `${normalizePath(config.settings.contracts_folder || "_contracts")}/`;
+  for (const file of vault.getMarkdownFiles()) {
+    if (!file.path.startsWith(folderPrefix)) continue;
+    const parsed = parseFrontmatter(await vault.cachedRead(file));
+    if (!parsed.hasFrontmatter || parsed.error) continue;
+    const frontmatter = parsed.frontmatter;
+    if (frontmatter.kind !== "mdbase.contract" || frontmatter.contract_type !== "record") continue;
+    if (typeof frontmatter.id !== "string" || typeof frontmatter.version !== "string") continue;
+    const recordSchema = isRecord(frontmatter.record_schema) ? frontmatter.record_schema : {};
+    const bindingSchema = isRecord(frontmatter.binding_schema) ? frontmatter.binding_schema : undefined;
+    const schema = await resolveContractSchema(vault, file.path, recordSchema);
+    if (!schema) continue;
+    const binding = bindingSchema ? await resolveContractSchema(vault, file.path, bindingSchema) : null;
+    const key = `${frontmatter.id}@${frontmatter.version}`;
+    contracts.set(key, {
+      contract_type: "record",
+      id: frontmatter.id,
+      version: frontmatter.version,
+      digest: typeof frontmatter.digest === "string" ? frontmatter.digest : "",
+      schema,
+      ...(binding ? { binding_schema: binding } : {}),
+      implementations: [],
+    });
+  }
+  return contracts;
+}
+
+async function resolveContractSchema(
+  vault: Vault,
+  contractPath: string,
+  wrapper: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+  if (isRecord(wrapper.value)) return deepClone(wrapper.value);
+  if (typeof wrapper.ref !== "string") return null;
+  return resolveV03SchemaRef(vault, contractPath, wrapper.ref);
 }
 
 function getExplicitTypes(frontmatter: Record<string, unknown>, explicitTypeKeys: string[]): string[] | null {

@@ -10,7 +10,9 @@ const expression = `(async()=>{
   const measure=async(operation)=>{const start=performance.now();const value=await operation();return{ms:performance.now()-start,value}};
   const heapBefore=performance.memory?.usedJSHeapSize??null;
   const schema=await measure(()=>plugin.loadWorkspaceSchema(true));
-  const migration=await measure(()=>plugin.analyzeMigration());
+  const migration=schema.value?.config?.spec_version?.startsWith('0.2.')
+    ?await measure(()=>plugin.analyzeMigration())
+    :{ms:0,value:{operations:[]}};
   const validation=await measure(()=>plugin.validateCollection());
   const issuesRender=await measure(()=>plugin.openWorkspace('issues'));
   const heapAfter=performance.memory?.usedJSHeapSize??null;
@@ -48,4 +50,3 @@ for (const [metric, limit] of Object.entries(baseline.maximums)) {
 }
 console.log(JSON.stringify({ profile, baseline, passed: failures.length === 0 }, null, 2));
 if (failures.length) throw new Error(`Performance regression: ${failures.join("; ")}`);
-

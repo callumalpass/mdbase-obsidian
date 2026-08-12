@@ -4,7 +4,11 @@ import {
   type MdbaseFieldDef,
   schemaFromV03Fields,
 } from "./mdbaseCore";
-import type { TypeEditorField, TypeEditorModel } from "./typeEditorTypes";
+import type {
+  TypeEditorContractImplementation,
+  TypeEditorField,
+  TypeEditorModel,
+} from "./typeEditorTypes";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -53,6 +57,7 @@ export function createDefaultTypeModel(): TypeEditorModel {
         },
       },
     ],
+    implementations: [],
     body: "# Type\n\nDescribe the type and intended usage.",
     extraFrontmatter: {},
   };
@@ -63,6 +68,22 @@ function toFields(value: unknown): TypeEditorField[] {
   return Object.entries(value)
     .filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]))
     .map(([name, definition]) => ({ name, definition: clone(definition) }));
+}
+
+function toImplementations(value: unknown): TypeEditorContractImplementation[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate) => {
+    if (!isRecord(candidate) || typeof candidate.contract !== "string" || typeof candidate.version !== "string") {
+      return [];
+    }
+    const fields = isRecord(candidate.fields)
+      ? Object.fromEntries(
+        Object.entries(candidate.fields).filter(([, field]) => typeof field === "string"),
+      ) as Record<string, string>
+      : {};
+    const binding = isRecord(candidate.binding) ? clone(candidate.binding) : undefined;
+    return [{ contract: candidate.contract, version: candidate.version, fields, ...(binding ? { binding } : {}) }];
+  });
 }
 
 function fieldsRecord(fields: TypeEditorField[]): Record<string, MdbaseFieldDef> {
@@ -202,6 +223,7 @@ export function typeModelFromDocument(
       : "",
     matchWhere,
     fields: fields.length || schemaReference ? fields : createDefaultTypeModel().fields,
+    implementations: toImplementations(frontmatter.implements),
     body: body.trim() || `# ${fallbackName}\n\nType definition for ${fallbackName}.`,
     extraFrontmatter,
     ...(schemaReference ? {
@@ -288,6 +310,19 @@ export function frontmatterFromTypeModel(model: TypeEditorModel): Record<string,
   else delete collection.links;
   if (Object.keys(collection).length) frontmatter.collection = collection;
   else delete frontmatter.collection;
+
+  if (model.implementations.length) {
+    frontmatter.implements = model.implementations.map((implementation) => ({
+      contract: implementation.contract,
+      version: implementation.version,
+      fields: clone(implementation.fields),
+      ...(implementation.binding && Object.keys(implementation.binding).length
+        ? { binding: clone(implementation.binding) }
+        : {}),
+    }));
+  } else {
+    delete frontmatter.implements;
+  }
 
   for (const legacy of ["fields", "strict", "extends", "display_name_key", "path_pattern", "filename_pattern"]) {
     delete frontmatter[legacy];

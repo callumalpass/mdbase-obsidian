@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { normalizePath, TFile, TFolder } from "obsidian";
 import type { AuthorityImportSnapshot } from "@mdbase-dev/connect-protocol";
+import { MemoryMirrorBlobStore } from "@mdbase-dev/connect-sync/mirror";
 import {
   AuthorityAdoptionError,
   AuthorityAdoptionOutcomeUnknownError,
@@ -26,10 +27,11 @@ const TestFolder = TFolder as unknown as { new(path: string): TFolder };
 
 class TestVault {
   private readonly files = new Map<string, { file: TFile; content: string }>();
+  private readonly binaryFiles = new Map<string, { file: TFile; content: ArrayBuffer }>();
   private readonly folders = new Set<string>();
 
   readonly adapter = {
-    exists: async (path: string) => this.files.has(normalizePath(path)) || this.folders.has(normalizePath(path)),
+    exists: async (path: string) => this.files.has(normalizePath(path)) || this.binaryFiles.has(normalizePath(path)) || this.folders.has(normalizePath(path)),
     read: async (path: string) => {
       const entry = this.files.get(normalizePath(path));
       if (!entry) throw new Error(`Missing file: ${path}`);
@@ -50,6 +52,7 @@ class TestVault {
   getAbstractFileByPath(path: string): TFile | TFolder | null {
     const normalized = normalizePath(path);
     return this.files.get(normalized)?.file
+      ?? this.binaryFiles.get(normalized)?.file
       ?? (this.folders.has(normalized) ? new TestFolder(normalized) : null);
   }
 
@@ -58,7 +61,10 @@ class TestVault {
   }
 
   getFiles(): TFile[] {
-    return [...this.files.values()].map(({ file }) => file);
+    return [
+      ...[...this.files.values()].map(({ file }) => file),
+      ...[...this.binaryFiles.values()].map(({ file }) => file),
+    ];
   }
 
   async cachedRead(file: TFile): Promise<string> {
@@ -74,6 +80,19 @@ class TestVault {
     const file = this.files.get(normalized)?.file ?? new TestFile(normalized);
     this.files.set(normalized, { file, content });
     return file;
+  }
+
+  async putBinary(path: string, content: Uint8Array): Promise<TFile> {
+    const normalized = normalizePath(path);
+    const file = this.binaryFiles.get(normalized)?.file ?? new TestFile(normalized);
+    this.binaryFiles.set(normalized, { file, content: Uint8Array.from(content).buffer });
+    return file;
+  }
+
+  async readBinary(file: TFile): Promise<ArrayBuffer> {
+    const content = this.binaryFiles.get(file.path)?.content;
+    if (!content) throw new Error(`Missing binary file: ${file.path}`);
+    return content.slice(0);
   }
 }
 
@@ -100,6 +119,7 @@ class FakeAdoption {
   readonly adoptionId = randomUUID();
   readonly session: AuthorityAdoptionSession;
   uploads: AuthorityImportSnapshot[] = [];
+  uploadedFileBytes: Uint8Array[][] = [];
   completionCalls = 0;
   state: "ready" | "activating" | "completed" = "ready";
   exchangeError: Error | null = null;
@@ -148,12 +168,19 @@ class FakeAdoption {
     _session: AuthorityAdoptionSession,
     _prepared: PreparedAuthorityAdoption,
     snapshot: AuthorityImportSnapshot,
+    options?: { fileSource?: (file: AuthorityImportSnapshot["files"][number]) => Promise<ArrayBuffer> },
   ): Promise<void> {
     if (this.options.failFinalUploadOnce && this.uploads.length === 1 && !this.failedFinalUpload) {
       this.failedFinalUpload = true;
       throw new Error("connection dropped during final upload");
     }
     this.uploads.push(structuredClone(snapshot));
+    const uploadedBytes: Uint8Array[] = [];
+    for (const file of snapshot.files) {
+      const source = await options?.fileSource?.(file);
+      if (source) uploadedBytes.push(new Uint8Array(source));
+    }
+    this.uploadedFileBytes.push(uploadedBytes);
     if (this.uploads.length >= 2) await this.options.editAfterFinalUpload?.();
   }
 
@@ -202,8 +229,10 @@ class FakeAdoption {
       status: "ready",
       adoption: this.adoptionView("prepared"),
       import: {
+        import_id: this.adoptionId,
         manifest_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/manifest`,
         records_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/records`,
+        files_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/files`,
         finalize_url: `https://provider.example/v1/authority-imports/${this.adoptionId}/finalize`,
         access_token: "ati_test_secret_abcdefghijklmnopqrstuvwxyz",
       },
@@ -312,12 +341,14 @@ async function fixture(options: FakeAdoptionOptions = {}) {
   };
   const settings = new TestSettings();
   const adoption = new FakeAdoption(collectionId, options);
+  const adoptionBlobs = new MemoryMirrorBlobStore();
   const controller = new ConnectSyncController(
     app as never,
     settings,
     {
       adoptionClient: adoption as unknown as AuthorityAdoptionClient,
       enrollmentClient: new FakeEnrollment(collectionId) as unknown as MirrorEnrollmentClient,
+      adoptionBlobStoreFactory: () => adoptionBlobs,
     },
   );
   await controller.initialize();
@@ -358,6 +389,23 @@ test("adopts every canonical resource and retains the existing vault as a mirror
   assert.equal(await vault.adapter.exists(".mdbase/connect-role.json"), true);
   assert.equal(await vault.adapter.exists(".mdbase/authority-adoption.json"), false);
   assert.equal(await vault.adapter.exists(".mdbase/authority-adoption-snapshot.json"), false);
+});
+
+test("adoption includes selected binary files and supplies their exact bytes", async () => {
+  const { vault, adoption, controller } = await fixture();
+  const bytes = Uint8Array.from([0, 4, 8, 15, 16, 23, 42, 255]);
+  await vault.putBinary("Attachments/evidence.png", bytes);
+  await vault.putBinary("Attachments/unselected.pdf", Uint8Array.of(9, 9, 9));
+  await controller.adoptLocalCollection({
+    controlUrl: "https://connect.example",
+    mirrorName: "Obsidian",
+    selectiveSync: { file_classes: ["image"], excluded_folders: [] },
+  }, callbacks);
+  const final = adoption.uploads.at(-1)!;
+  assert.deepEqual(final.files.map((file) => [file.path, file.media_class, file.size]), [
+    ["Attachments/evidence.png", "image", bytes.byteLength],
+  ]);
+  assert.deepEqual(adoption.uploadedFileBytes.at(-1), [bytes]);
 });
 
 test("a lost activation response keeps the exact snapshot fenced across restart", async () => {

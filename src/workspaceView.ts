@@ -1,12 +1,13 @@
 import {
   ItemView,
+  Modal,
   Notice,
   Platform,
   setIcon,
   TFile,
   WorkspaceLeaf,
 } from "obsidian";
-import type { MirrorInitializationPreview, MirrorProgress, MirrorStatus } from "@mdbase-dev/connect-sync/mirror";
+import type { MirrorProgress, MirrorStatus } from "@mdbase-dev/connect-sync/mirror";
 import type { AuthorityAdoptionStatus } from "@mdbase-dev/connect-sync/adoption";
 import type {
   ConnectSyncController,
@@ -17,21 +18,49 @@ import type {
   MdbaseIssue,
   MdbaseTypeDef,
 } from "./mdbaseCore";
+import type {
+  CollectionContractDescriptor,
+  FileMediaClass,
+  JsonObject,
+  SelectiveSyncPolicy,
+} from "@mdbase-dev/connect-protocol";
 import { formatMarkdown, parseFrontmatter } from "./mdbaseCore";
 import type { V02MigrationPlan } from "./migration";
 import { MDBASE_ICON_ID } from "./mdbaseIcon";
-import type { TypeEditorField, TypeEditorModel } from "./typeEditorTypes";
+import type { StoredTypeDraft, TypeEditorField, TypeEditorModel } from "./typeEditorTypes";
+import type { MdbaseSyncPreview, SyncPreviewDirection } from "./syncPreview";
 import {
   createDefaultTypeModel,
   frontmatterFromTypeModel,
   typeModelFromDocument,
 } from "./typeModel";
+import {
+  addImplementation,
+  assessMapping,
+  contractFields,
+  contractKey,
+  mappingForContractField,
+  removeImplementation,
+  schemaInitialValue,
+  schemaType,
+  schemaTypeLabel,
+  setBinding,
+  setFieldMapping,
+  typeFieldsForModel,
+} from "./typeContracts";
+import {
+  describeTypeChanges,
+  type TypeDraftChange,
+  typeModelsEqual,
+  validateTypeDraft,
+} from "./typeDraft";
 
 export const MDBASE_WORKSPACE_VIEW = "mdbase-workspace-view";
 
 export interface MdbaseWorkspaceSchema {
   config: MdbaseConfig;
   types: Map<string, MdbaseTypeDef>;
+  contracts: Map<string, CollectionContractDescriptor>;
 }
 
 export interface MdbaseWorkspaceHost {
@@ -39,13 +68,25 @@ export interface MdbaseWorkspaceHost {
   getMirrorProfile(): MirrorProfile | null;
   loadWorkspaceSchema(forceReload?: boolean): Promise<MdbaseWorkspaceSchema | null>;
   loadTypeModel(path: string): Promise<TypeEditorModel>;
-  saveTypeModel(model: TypeEditorModel, existingPath: string | null): Promise<TFile>;
+  saveTypeModel(model: TypeEditorModel, existingPath: string | null, expectedSourceRevision?: string): Promise<TFile>;
+  loadTypeDraft(path: string | null): StoredTypeDraft | null;
+  saveTypeDraft(draft: StoredTypeDraft): Promise<void>;
+  clearTypeDraft(path: string | null): Promise<void>;
   initializeCollection(): Promise<void>;
   getIssues(): MdbaseIssue[];
   validateCollection(): Promise<void>;
+  getQuickFixLabel(issue: MdbaseIssue): string | null;
+  applyQuickFix(issue: MdbaseIssue): Promise<void>;
   openFileByPath(path: string, field?: string): Promise<void>;
   analyzeMigration(): Promise<V02MigrationPlan>;
   applyMigration(plan: V02MigrationPlan, allowLossy: boolean): Promise<void>;
+}
+
+interface RenderSnapshot {
+  focusKey: string | null;
+  selectionStart: number | null;
+  selectionEnd: number | null;
+  scroll: Map<string, { top: number; left: number }>;
 }
 
 type Destination = "types" | "sync" | "issues";
@@ -98,29 +139,6 @@ function setOwnField(
   });
 }
 
-function changeSummary(original: TypeEditorModel | null, current: TypeEditorModel): string[] {
-  if (!original) return ["A new type definition will be created."];
-  const changes: string[] = [];
-  if (original.name !== current.name) changes.push(`Rename type from ${original.name} to ${current.name}.`);
-  if (original.matchPathGlob !== current.matchPathGlob
-    || original.matchFieldsPresent !== current.matchFieldsPresent
-    || original.matchWhere !== current.matchWhere) {
-    changes.push("Membership rules changed; different records may match this type.");
-  }
-  const before = new Map(original.fields.map((field) => [field.name, field]));
-  const after = new Map(current.fields.map((field) => [field.name, field]));
-  const removed = [...before.keys()].filter((name) => !after.has(name));
-  const added = [...after.keys()].filter((name) => !before.has(name));
-  if (added.length) changes.push(`Add ${added.length} field${added.length === 1 ? "" : "s"}: ${added.join(", ")}.`);
-  if (removed.length) changes.push(`Remove ${removed.length} field${removed.length === 1 ? "" : "s"}: ${removed.join(", ")}.`);
-  const newlyRequired = [...after.entries()]
-    .filter(([name, field]) => field.definition.required === true && before.get(name)?.definition.required !== true)
-    .map(([name]) => name);
-  if (newlyRequired.length) changes.push(`New required fields may invalidate records: ${newlyRequired.join(", ")}.`);
-  if (!changes.length) changes.push("Metadata, schema details, or documentation changed.");
-  return changes;
-}
-
 function inputRow(
   container: HTMLElement,
   label: string,
@@ -137,6 +155,7 @@ function inputRow(
     ? row.createEl("textarea")
     : row.createEl("input", { type: "text" });
   control.id = id;
+  control.setAttr("data-focus-key", `form-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
   control.value = value;
   control.placeholder = options.placeholder ?? "";
   control.addEventListener("input", () => onInput(control.value));
@@ -155,6 +174,87 @@ function compactCount(value: number): string {
   return `${(value / 1_000).toFixed(digits)}k`;
 }
 
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function relativeTime(value: string | null | undefined): string {
+  if (!value) return "Never synced";
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  const seconds = Math.round((timestamp - Date.now()) / 1_000);
+  const absolute = Math.abs(seconds);
+  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  if (absolute < 60) return formatter.format(seconds, "second");
+  const minutes = Math.round(seconds / 60);
+  if (Math.abs(minutes) < 60) return formatter.format(minutes, "minute");
+  const hours = Math.round(minutes / 60);
+  if (Math.abs(hours) < 24) return formatter.format(hours, "hour");
+  return formatter.format(Math.round(hours / 24), "day");
+}
+
+function syncStateLabel(status: MirrorStatus | null): string {
+  if (!status) return "Checking connection";
+  if (status.state === "up_to_date") return "Up to date";
+  if (status.state === "changes_waiting") return "Local changes waiting";
+  if (status.state === "attention") return "Needs attention";
+  return "Ready for first sync";
+}
+
+function syncPreviewSignature(preview: MdbaseSyncPreview): string {
+  return JSON.stringify({
+    phase: preview.phase,
+    cursor: preview.cursor,
+    remoteHead: preview.remoteHead,
+    collisions: preview.collisions,
+    entries: preview.entries.map((entry) => [entry.kind, entry.direction, entry.action, entry.path, entry.recordId ?? entry.fileId ?? ""]),
+  });
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+class TypeChangeConfirmationModal extends Modal {
+  private resolve: ((confirmed: boolean) => void) | null = null;
+  private settled = false;
+
+  confirm(changes: readonly TypeDraftChange[]): Promise<boolean> {
+    return new Promise((resolve) => {
+      this.resolve = resolve;
+      this.titleEl.setText("Confirm high-impact type changes");
+      this.contentEl.createEl("p", {
+        text: "These schema changes can change membership or invalidate existing records. The plugin will save only the type definition; it will not rewrite records.",
+      });
+      const list = this.contentEl.createEl("ul", { cls: "mdbase-confirm-change-list" });
+      for (const change of changes) list.createEl("li", { text: change.summary });
+      const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+      const cancel = actions.createEl("button", { text: "Keep reviewing" });
+      cancel.onclick = () => this.finish(false);
+      const save = actions.createEl("button", { text: "Save high-impact changes" });
+      save.addClass("mod-warning");
+      save.onclick = () => this.finish(true);
+      this.open();
+    });
+  }
+
+  onClose(): void {
+    if (!this.settled) this.finish(false, false);
+    this.contentEl.empty();
+  }
+
+  private finish(confirmed: boolean, close = true): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.resolve?.(confirmed);
+    this.resolve = null;
+    if (close) this.close();
+  }
+}
+
 export class MdbaseWorkspaceView extends ItemView {
   private destination: Destination = "types";
   private editorMode: EditorMode = "design";
@@ -169,7 +269,7 @@ export class MdbaseWorkspaceView extends ItemView {
   private migrationPlan: V02MigrationPlan | null = null;
   private allowLossy = false;
   private mirrorStatus: MirrorStatus | null = null;
-  private mirrorPreview: MirrorInitializationPreview | null = null;
+  private mirrorPreview: MdbaseSyncPreview | null = null;
   private mirrorProgress: MirrorProgress | null = null;
   private transientMessage = "";
   private issueQuery = "";
@@ -177,6 +277,18 @@ export class MdbaseWorkspaceView extends ItemView {
   private issueLimit = 250;
   private enrollmentVerification = "";
   private enrollmentAbort: AbortController | null = null;
+  private enrollmentControlUrl = "https://connect.mdbase.dev";
+  private enrollmentMirrorName = "Obsidian";
+  private enrollmentCollectionId = "";
+  private enrollmentMode: "read_only" | "read_write" = "read_write";
+  private filePolicyDraft: SelectiveSyncPolicy | null = null;
+  private adoptionFileProgress = "";
+  private draftSaveTimer: number | null = null;
+  private fieldQuery = "";
+  private readonly expandedFields = new Set<string>();
+  private readonly fieldIds = new WeakMap<Record<string, unknown>, string>();
+  private nextFieldId = 1;
+  private refreshVersion = 0;
 
   constructor(leaf: WorkspaceLeaf, private readonly host: MdbaseWorkspaceHost) {
     super(leaf);
@@ -196,17 +308,27 @@ export class MdbaseWorkspaceView extends ItemView {
 
   async onOpen(): Promise<void> {
     this.containerEl.addClass("mdbase-workspace");
+    this.registerDomEvent(this.containerEl, "keydown", (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s" && this.dirty) {
+        event.preventDefault();
+        void this.saveCurrentType();
+      }
+    });
     await this.refresh(true);
   }
 
   async onClose(): Promise<void> {
+    await this.flushTypeDraft();
     this.enrollmentAbort?.abort();
     this.enrollmentAbort = null;
   }
 
   async refresh(forceReload = false): Promise<void> {
+    const version = ++this.refreshVersion;
     try {
-      this.schema = await this.host.loadWorkspaceSchema(forceReload);
+      const schema = await this.host.loadWorkspaceSchema(forceReload);
+      if (version !== this.refreshVersion) return;
+      this.schema = schema;
       if (this.selectedPath && !this.typeEntries().some((entry) => entry.filePath === this.selectedPath)) {
         this.selectedPath = null;
         this.model = null;
@@ -217,10 +339,13 @@ export class MdbaseWorkspaceView extends ItemView {
       }
       if (this.selectedPath && (!this.model || forceReload)) {
         await this.selectType(this.selectedPath, false);
+        if (version !== this.refreshVersion) return;
       }
       if (this.destination === "sync") await this.refreshMirrorStatus();
+      if (version !== this.refreshVersion) return;
       this.render();
     } catch (error) {
+      if (version !== this.refreshVersion) return;
       this.transientMessage = error instanceof Error ? error.message : String(error);
       this.render();
     }
@@ -232,6 +357,16 @@ export class MdbaseWorkspaceView extends ItemView {
     else this.render();
   }
 
+  createNewType(): void {
+    this.destination = "types";
+    this.createType();
+  }
+
+  async editType(path: string): Promise<void> {
+    this.destination = "types";
+    await this.selectType(path);
+  }
+
   private typeEntries(): MdbaseTypeDef[] {
     return this.schema
       ? [...this.schema.types.values()].sort((a, b) => a.name.localeCompare(b.name))
@@ -240,6 +375,7 @@ export class MdbaseWorkspaceView extends ItemView {
 
   private render(): void {
     const root = this.containerEl;
+    const snapshot = this.captureRenderSnapshot(root);
     root.empty();
     root.addClass("mdbase-workspace");
     const shell = root.createDiv({ cls: "mdbase-shell" });
@@ -249,9 +385,44 @@ export class MdbaseWorkspaceView extends ItemView {
       message.setAttr("role", "status");
     }
     const content = shell.createDiv({ cls: "mdbase-workspace-content" });
+    content.setAttr("data-scroll-key", "workspace");
     if (this.destination === "types") this.renderTypes(content);
     else if (this.destination === "sync") this.renderSync(content);
     else this.renderIssues(content);
+    this.restoreRenderSnapshot(root, snapshot);
+  }
+
+  private captureRenderSnapshot(root: HTMLElement): RenderSnapshot {
+    const active = root.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
+    const editable = active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement ? active : null;
+    const scroll = new Map<string, { top: number; left: number }>();
+    for (const element of Array.from(root.querySelectorAll<HTMLElement>("[data-scroll-key]"))) {
+      const key = element.getAttr("data-scroll-key");
+      if (key) scroll.set(key, { top: element.scrollTop, left: element.scrollLeft });
+    }
+    return {
+      focusKey: active?.getAttr("data-focus-key") ?? null,
+      selectionStart: editable?.selectionStart ?? null,
+      selectionEnd: editable?.selectionEnd ?? null,
+      scroll,
+    };
+  }
+
+  private restoreRenderSnapshot(root: HTMLElement, snapshot: RenderSnapshot): void {
+    for (const [key, position] of snapshot.scroll) {
+      const element = root.querySelector<HTMLElement>(`[data-scroll-key="${key}"]`);
+      if (!element) continue;
+      element.scrollTop = position.top;
+      element.scrollLeft = position.left;
+    }
+    if (!snapshot.focusKey) return;
+    const active = root.querySelector<HTMLElement>(`[data-focus-key="${snapshot.focusKey}"]`);
+    active?.focus({ preventScroll: true });
+    if (
+      (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement)
+      && snapshot.selectionStart !== null
+      && snapshot.selectionEnd !== null
+    ) active.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
   }
 
   private renderTopbar(container: HTMLElement): void {
@@ -402,6 +573,7 @@ export class MdbaseWorkspaceView extends ItemView {
     search.addClass("mdbase-type-search");
     search.placeholder = "Search types";
     search.setAttr("aria-label", "Search types");
+    search.setAttr("data-focus-key", "type-search");
     search.value = this.query;
     search.oninput = () => {
       this.query = search.value;
@@ -412,6 +584,7 @@ export class MdbaseWorkspaceView extends ItemView {
     };
 
     const list = pane.createDiv({ cls: "mdbase-type-list" });
+    list.setAttr("data-scroll-key", "type-list");
     const query = this.query.trim().toLowerCase();
     const entries = this.typeEntries().filter((entry) =>
       `${entry.name} ${entry.description ?? ""} ${entry.filePath}`.toLowerCase().includes(query));
@@ -434,6 +607,7 @@ export class MdbaseWorkspaceView extends ItemView {
 
   private renderTypeEditor(container: HTMLElement): void {
     const pane = container.createDiv({ cls: "mdbase-type-editor-pane" });
+    pane.setAttr("data-scroll-key", "type-editor");
     if (!this.model) {
       const empty = pane.createDiv({ cls: "mdbase-empty-state" });
       empty.createEl("h2", { text: "Choose a type" });
@@ -476,6 +650,10 @@ export class MdbaseWorkspaceView extends ItemView {
     save.addClass("mod-cta");
     save.disabled = readOnly || !this.dirty || this.busy;
     save.onclick = () => void this.saveCurrentType();
+    if (this.dirty) {
+      const discard = headerActions.createEl("button", { text: "Discard" });
+      discard.onclick = () => void this.discardCurrentType();
+    }
 
     if (readOnly) {
       pane.createDiv({
@@ -494,12 +672,52 @@ export class MdbaseWorkspaceView extends ItemView {
     }
 
     const editor = pane.createDiv({ cls: "mdbase-editor-document" });
+    editor.setAttr("data-scroll-key", "type-document");
     if (this.editorMode === "design") this.renderDesignEditor(editor, this.model, readOnly);
     else this.renderYamlEditor(editor, readOnly);
+    if (this.dirty && !readOnly) this.renderDraftBar(pane, this.model);
+  }
+
+  private renderDraftBar(container: HTMLElement, model: TypeEditorModel): void {
+    const changes = describeTypeChanges(this.originalModel, model);
+    const diagnostics = validateTypeDraft(model, {
+      knownTypes: this.typeEntries().map((type) => type.name),
+      contracts: this.schema?.contracts.values(),
+    });
+    const errorCount = diagnostics.filter((diagnostic) => diagnostic.severity === "error").length;
+    const highRiskCount = changes.filter((change) => change.risk === "high").length;
+    const bar = container.createDiv({ cls: "mdbase-draft-bar" });
+    const summary = bar.createDiv({ cls: "mdbase-draft-summary" });
+    summary.createEl("strong", { text: `${changes.length} pending ${changes.length === 1 ? "change" : "changes"}` });
+    summary.createSpan({
+      text: errorCount
+        ? `${errorCount} ${errorCount === 1 ? "error" : "errors"} to fix`
+        : highRiskCount
+          ? `${highRiskCount} high-impact ${highRiskCount === 1 ? "change" : "changes"}`
+          : "Ready to save",
+    });
+    const actions = bar.createDiv({ cls: "mdbase-actions" });
+    if (this.editorMode === "design") {
+      const review = actions.createEl("button", { text: "Review" });
+      review.onclick = () => this.containerEl.querySelector<HTMLElement>("#mdbase-section-review")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    const discard = actions.createEl("button", { text: "Discard" });
+    discard.onclick = () => void this.discardCurrentType();
+    const save = actions.createEl("button", { text: "Save changes" });
+    save.addClass("mod-cta");
+    save.disabled = errorCount > 0 || this.busy;
+    save.onclick = () => void this.saveCurrentType();
   }
 
   private renderDesignEditor(container: HTMLElement, model: TypeEditorModel, readOnly: boolean): void {
+    const diagnostics = validateTypeDraft(model, {
+      knownTypes: this.typeEntries().map((type) => type.name),
+      contracts: this.schema?.contracts.values(),
+    });
+    this.renderSectionNavigation(container, diagnostics);
     const identity = container.createEl("section", { cls: "mdbase-editor-section" });
+    identity.id = "mdbase-section-identity";
     identity.createEl("h3", { text: "Identity" });
     const name = inputRow(identity, "Name", model.name, (value) => {
       model.name = value;
@@ -511,10 +729,22 @@ export class MdbaseWorkspaceView extends ItemView {
       this.markDirty();
     }, { multiline: true });
     description.disabled = readOnly;
-    const display = inputRow(identity, "Display field", model.displayNameKey, (value) => {
-      model.displayNameKey = value;
+    const displayRow = identity.createDiv({ cls: "mdbase-form-row" });
+    const displayLabel = displayRow.createEl("label", { text: "Display field" });
+    const display = displayRow.createEl("select");
+    displayLabel.htmlFor = display.id = "mdbase-display-field";
+    display.createEl("option", { value: "", text: "Use the file name" });
+    for (const field of model.fields) {
+      display.createEl("option", { value: field.name, text: field.name || "Unnamed field" });
+    }
+    if (model.displayNameKey && !model.fields.some((field) => field.name === model.displayNameKey)) {
+      display.createEl("option", { value: model.displayNameKey, text: `${model.displayNameKey} · missing` });
+    }
+    display.value = model.displayNameKey;
+    display.onchange = () => {
+      model.displayNameKey = display.value;
       this.markDirty();
-    }, { placeholder: "title" });
+    };
     display.disabled = readOnly;
     const strictRow = identity.createEl("label", { cls: "mdbase-checkbox-row" });
     const strict = strictRow.createEl("input", { type: "checkbox" });
@@ -527,6 +757,7 @@ export class MdbaseWorkspaceView extends ItemView {
     strictRow.createSpan({ text: "Reject undeclared fields" });
 
     const membership = container.createEl("section", { cls: "mdbase-editor-section" });
+    membership.id = "mdbase-section-membership";
     membership.createEl("h3", { text: "Membership" });
     const glob = inputRow(membership, "Path glob", model.matchPathGlob, (value) => {
       model.matchPathGlob = value;
@@ -549,21 +780,56 @@ export class MdbaseWorkspaceView extends ItemView {
     where.disabled = readOnly;
 
     const fields = container.createEl("section", { cls: "mdbase-editor-section" });
+    fields.id = "mdbase-section-fields";
     const fieldsHeader = fields.createDiv({ cls: "mdbase-section-header" });
     fieldsHeader.createEl("h3", { text: "Fields" });
     const addField = fieldsHeader.createEl("button", { text: "Add field" });
     addField.disabled = readOnly;
     addField.onclick = () => {
-      model.fields.push({ name: "", definition: { type: "string" } });
+      const definition: Record<string, unknown> = { type: "string" };
+      model.fields.push({ name: "", definition });
+      this.expandedFields.add(this.fieldId(definition));
       this.markDirty(true);
     };
+    const fieldToolbar = fields.createDiv({ cls: "mdbase-field-toolbar" });
+    const requiredCount = model.fields.filter((field) => field.definition.required === true).length;
+    fieldToolbar.createDiv({
+      cls: "mdbase-field-count",
+      text: `${model.fields.length} ${model.fields.length === 1 ? "field" : "fields"} · ${requiredCount} required`,
+    });
+    const fieldActions = fieldToolbar.createDiv({ cls: "mdbase-field-toolbar-actions" });
+    const fieldSearch = fieldActions.createEl("input", { type: "search" });
+    fieldSearch.placeholder = "Filter fields";
+    fieldSearch.setAttr("aria-label", "Filter fields");
+    fieldSearch.setAttr("data-focus-key", "field-search");
+    fieldSearch.value = this.fieldQuery;
+    fieldSearch.oninput = () => {
+      this.fieldQuery = fieldSearch.value;
+      this.render();
+    };
+    const collapse = fieldActions.createEl("button", { text: "Collapse all" });
+    collapse.disabled = this.expandedFields.size === 0;
+    collapse.onclick = () => {
+      this.expandedFields.clear();
+      this.render();
+    };
     const fieldList = fields.createDiv({ cls: "mdbase-fields" });
-    for (const [index, field] of model.fields.entries()) {
+    const normalizedFieldQuery = this.fieldQuery.trim().toLowerCase();
+    const visibleFields = model.fields.filter((field) =>
+      !normalizedFieldQuery || this.fieldMatches(field.name, field.definition, normalizedFieldQuery));
+    for (const field of visibleFields) {
+      const index = model.fields.indexOf(field);
       this.renderFieldRow(fieldList, field, index, readOnly);
     }
-    if (!model.fields.length) fieldList.createDiv({ cls: "mdbase-empty-list", text: "No fields declared." });
+    if (!visibleFields.length) {
+      fieldList.createDiv({
+        cls: "mdbase-empty-list",
+        text: model.fields.length ? "No fields match this filter." : "No fields declared.",
+      });
+    }
 
     const placement = container.createEl("section", { cls: "mdbase-editor-section" });
+    placement.id = "mdbase-section-placement";
     placement.createEl("h3", { text: "Placement" });
     const path = inputRow(placement, "Path pattern", model.pathPattern, (value) => {
       model.pathPattern = value;
@@ -571,14 +837,325 @@ export class MdbaseWorkspaceView extends ItemView {
     }, { placeholder: "Notes/{title}.md" });
     path.disabled = readOnly;
 
+    this.renderContractEditor(container, model, readOnly);
+
     const review = container.createEl("section", { cls: "mdbase-editor-section mdbase-change-review" });
+    review.id = "mdbase-section-review";
     review.createEl("h3", { text: "Change review" });
+    if (diagnostics.length) {
+      const diagnosticSummary = review.createDiv({ cls: "mdbase-diagnostic-summary" });
+      const errors = diagnostics.filter((diagnostic) => diagnostic.severity === "error").length;
+      const warnings = diagnostics.length - errors;
+      diagnosticSummary.createEl("strong", {
+        text: `${errors} ${errors === 1 ? "error" : "errors"} · ${warnings} ${warnings === 1 ? "warning" : "warnings"}`,
+      });
+      for (const diagnostic of diagnostics.slice(0, 12)) {
+        const item = diagnosticSummary.createDiv({ cls: "mdbase-diagnostic-item" });
+        item.setAttr("data-severity", diagnostic.severity);
+        item.createEl("code", { text: diagnostic.path });
+        item.createSpan({ text: diagnostic.message });
+      }
+    }
     if (!this.dirty) {
       review.createEl("p", { text: "No pending changes." });
     } else {
       const list = review.createEl("ul");
-      for (const change of changeSummary(this.originalModel, model)) list.createEl("li", { text: change });
+      for (const change of describeTypeChanges(this.originalModel, model)) {
+        const item = list.createEl("li", { text: change.summary });
+        item.setAttr("data-risk", change.risk);
+      }
     }
+  }
+
+  private renderSectionNavigation(container: HTMLElement, diagnostics: readonly { severity: string }[]): void {
+    const navigation = container.createDiv({ cls: "mdbase-section-nav" });
+    navigation.setAttr("aria-label", "Type sections");
+    navigation.setAttr("data-scroll-key", "section-nav");
+    const items = [
+      ["identity", "Overview"],
+      ["membership", "Membership"],
+      ["fields", "Fields"],
+      ["applications", "Applications"],
+      ["review", diagnostics.some((item) => item.severity === "error") ? "Review · errors" : "Review"],
+    ] as const;
+    for (const [id, label] of items) {
+      const button = navigation.createEl("button", { text: label });
+      button.onclick = () => {
+        this.containerEl.querySelector<HTMLElement>(`#mdbase-section-${id}`)?.scrollIntoView({
+          behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+          block: "start",
+        });
+      };
+    }
+  }
+
+  private renderContractEditor(container: HTMLElement, model: TypeEditorModel, readOnly: boolean): void {
+    const section = container.createEl("section", { cls: "mdbase-editor-section mdbase-contracts-section" });
+    section.id = "mdbase-section-applications";
+    const header = section.createDiv({ cls: "mdbase-section-header" });
+    const heading = header.createDiv();
+    heading.createEl("h3", { text: "Works with applications" });
+    heading.createDiv({
+      cls: "mdbase-form-description",
+      text: "Tell compatible applications what this type's fields mean.",
+    });
+
+    const contracts = [...(this.schema?.contracts.values() ?? [])];
+    const implemented = new Set(model.implementations.map((implementation) => `${implementation.contract}@${implementation.version}`));
+    const available = contracts.filter((contract) => !implemented.has(contractKey(contract)));
+
+    if (!contracts.length) {
+      section.createDiv({
+        cls: "mdbase-contract-empty",
+        text: "No record contracts are installed in this collection. Add contract files under the configured contracts folder to connect this type to an application.",
+      });
+    }
+
+    for (const implementation of model.implementations) {
+      const contract = contracts.find((candidate) =>
+        candidate.id === implementation.contract && candidate.version === implementation.version);
+      this.renderContractImplementation(section, model, implementation, contract, readOnly);
+    }
+
+    if (available.length) {
+      const add = section.createDiv({ cls: "mdbase-contract-add" });
+      const label = add.createEl("label", { text: "Installed contract" });
+      const select = add.createEl("select");
+      label.htmlFor = select.id = `mdbase-contract-${Math.random().toString(36).slice(2)}`;
+      for (const contract of available) {
+        select.createEl("option", { value: contractKey(contract), text: `${contract.id} · ${contract.version}` });
+      }
+      const button = add.createEl("button", { text: "Connect application contract" });
+      button.disabled = readOnly;
+      button.onclick = () => {
+        const selected = available.find((candidate) => contractKey(candidate) === select.value);
+        if (!selected) return;
+        try {
+          addImplementation(model, selected);
+          this.markDirty(true);
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : String(error));
+        }
+      };
+    }
+  }
+
+  private renderContractImplementation(
+    container: HTMLElement,
+    model: TypeEditorModel,
+    implementation: TypeEditorModel["implementations"][number],
+    contract: CollectionContractDescriptor | undefined,
+    readOnly: boolean,
+  ): void {
+    const article = container.createEl("article", { cls: "mdbase-contract-implementation" });
+    const header = article.createDiv({ cls: "mdbase-contract-header" });
+    const identity = header.createDiv();
+    identity.createEl("strong", { text: implementation.contract });
+    identity.createSpan({ cls: "mdbase-contract-version", text: implementation.version });
+    const remove = header.createEl("button", { text: "Remove" });
+    remove.disabled = readOnly;
+    remove.onclick = () => {
+      removeImplementation(model, implementation.contract, implementation.version);
+      this.markDirty(true);
+    };
+
+    if (!contract) {
+      article.createDiv({
+        cls: "mdbase-contract-unavailable",
+        text: "This exact contract is not installed in the collection. Restore it or remove this implementation before saving.",
+      });
+      return;
+    }
+
+    const fields = contractFields(contract);
+    const typeFields = typeFieldsForModel(model);
+    const mapped = fields.filter((field) => mappingForContractField(implementation, field));
+    const required = fields.filter((field) => field.required);
+    const requiredMapped = required.filter((field) => mappingForContractField(implementation, field)).length;
+    const details = article.createEl("details");
+    details.open = requiredMapped < required.length;
+    const summary = details.createEl("summary");
+    summary.createSpan({ text: "Field mappings" });
+    summary.createSpan({
+      cls: "mdbase-contract-summary",
+      text: `${requiredMapped}/${required.length} required · ${mapped.length}/${fields.length} total`,
+    });
+    const mappingList = details.createDiv({ cls: "mdbase-contract-mapping-list" });
+    if (!fields.length) {
+      mappingList.createDiv({
+        cls: "mdbase-contract-unavailable",
+        text: "This contract does not expose simple top-level properties. Configure its field references in YAML.",
+      });
+    }
+    for (const field of fields) {
+      const current = mappingForContractField(implementation, field);
+      const mappedField = typeFields.find((candidate) => candidate.reference === current);
+      const assessment = assessMapping(field, mappedField);
+      const row = mappingList.createDiv({ cls: `mdbase-contract-mapping-row ${assessment.level}` });
+      const definition = row.createDiv({ cls: "mdbase-contract-field-definition" });
+      definition.createEl("code", { text: field.reference });
+      definition.createSpan({
+        cls: field.required ? "mdbase-contract-required" : "mdbase-contract-optional",
+        text: field.required ? "Required" : "Optional",
+      });
+      definition.createEl("small", { text: field.description || schemaTypeLabel(field.schema) });
+      const source = row.createEl("select");
+      source.setAttr("aria-label", `${implementation.contract} ${field.reference} source field`);
+      source.setAttr("aria-invalid", assessment.level === "error" ? "true" : "false");
+      source.disabled = readOnly;
+      source.createEl("option", { value: "", text: field.required ? "Choose a source field" : "Not exposed" });
+      for (const candidate of typeFields) {
+        const optionAssessment = assessMapping(field, candidate);
+        const option = source.createEl("option", {
+          value: candidate.reference,
+          text: `${candidate.reference} · ${candidate.type}${optionAssessment.level === "warning" ? " · review" : ""}`,
+        });
+        option.disabled = optionAssessment.level === "error";
+      }
+      source.value = current;
+      source.onchange = () => {
+        setFieldMapping(implementation, field.reference, source.value || undefined);
+        this.markDirty(true);
+      };
+      const status = row.createDiv({ cls: "mdbase-contract-mapping-status" });
+      status.createEl("strong", { text: assessment.label });
+      status.createEl("small", { text: assessment.message });
+    }
+
+    if (contract.binding_schema) {
+      const settings = article.createEl("details", { cls: "mdbase-contract-settings" });
+      settings.open = Boolean(implementation.binding);
+      const settingsSummary = settings.createEl("summary");
+      settingsSummary.createSpan({ text: "Contract settings" });
+      settingsSummary.createSpan({
+        cls: "mdbase-contract-summary",
+        text: implementation.binding ? "Configured" : "Optional",
+      });
+      const body = settings.createDiv({ cls: "mdbase-contract-settings-body" });
+      body.createEl("p", {
+        cls: "mdbase-form-description",
+        text: "Control how compatible applications interpret this type. Values follow the contract's schema.",
+      });
+      if (!implementation.binding) {
+        const configure = body.createEl("button", { text: "Configure settings" });
+        configure.disabled = readOnly;
+        configure.onclick = () => {
+          const initial = schemaInitialValue(contract.binding_schema);
+          if (!isRecord(initial)) return;
+          setBinding(implementation, initial);
+          this.markDirty(true);
+        };
+      } else {
+        this.renderContractSchemaValue(body, contract.binding_schema, implementation.binding, (value) => {
+          if (!isRecord(value)) return;
+          setBinding(implementation, value);
+          this.markDirty();
+        }, "Settings", readOnly);
+      }
+    }
+  }
+
+  private renderContractSchemaValue(
+    container: HTMLElement,
+    schema: JsonObject,
+    value: unknown,
+    onChange: (value: unknown) => void,
+    label: string,
+    readOnly: boolean,
+  ): void {
+    const type = schemaType(schema);
+    if (type === "object") {
+      const object = isRecord(value) ? value : {};
+      const fieldset = container.createEl("fieldset", { cls: "mdbase-contract-schema-object" });
+      fieldset.createEl("legend", { text: label });
+      const properties = isRecord(schema.properties) ? schema.properties : {};
+      const required = new Set(Array.isArray(schema.required) ? schema.required.map(String) : []);
+      const names = [...new Set([...required, ...Object.keys(object).filter((name) => name in properties)])];
+      for (const name of names) {
+        const childSchema = properties[name];
+        if (!isRecord(childSchema)) continue;
+        const row = fieldset.createDiv({ cls: "mdbase-contract-schema-field" });
+        const description = typeof childSchema.description === "string" ? childSchema.description : undefined;
+        row.createEl("label", { text: `${name}${required.has(name) ? " · required" : ""}` });
+        if (description) row.createEl("small", { text: description });
+        this.renderContractSchemaControl(row, childSchema, object[name], (next) => {
+          onChange({ ...object, [name]: next });
+        }, name, readOnly);
+      }
+      if (!names.length) fieldset.createDiv({ cls: "mdbase-empty-list", text: "No settings declared." });
+      const optional = Object.keys(properties).filter((name) => !names.includes(name));
+      if (optional.length) {
+        const add = fieldset.createDiv({ cls: "mdbase-contract-schema-add" });
+        const select = add.createEl("select");
+        for (const name of optional) select.createEl("option", { value: name, text: name });
+        const button = add.createEl("button", { text: "Add optional setting" });
+        button.disabled = readOnly;
+        button.onclick = () => {
+          const name = select.value;
+          const childSchema = properties[name];
+          if (!isRecord(childSchema)) return;
+          onChange({ ...object, [name]: schemaInitialValue(childSchema) });
+        };
+      }
+      return;
+    }
+    this.renderContractSchemaControl(container, schema, value, onChange, label, readOnly);
+  }
+
+  private renderContractSchemaControl(
+    container: HTMLElement,
+    schema: JsonObject,
+    value: unknown,
+    onChange: (value: unknown) => void,
+    label: string,
+    readOnly: boolean,
+  ): void {
+    const type = schemaType(schema);
+    if (Array.isArray(schema.enum)) {
+      const select = container.createEl("select");
+      select.setAttr("aria-label", label);
+      for (const choice of schema.enum) select.createEl("option", { value: JSON.stringify(choice), text: String(choice) });
+      select.value = JSON.stringify(value);
+      select.disabled = readOnly;
+      select.onchange = () => onChange(JSON.parse(select.value));
+      return;
+    }
+    if (type === "array") {
+      const itemsSchema = isRecord(schema.items) ? schema.items : { type: "string" };
+      const list = Array.isArray(value) ? value : [];
+      const listEl = container.createDiv({ cls: "mdbase-contract-schema-array" });
+      for (const [index, item] of list.entries()) {
+        const itemEl = listEl.createDiv({ cls: "mdbase-contract-schema-array-item" });
+        itemEl.createSpan({ text: `${index + 1}.` });
+        this.renderContractSchemaControl(itemEl, itemsSchema, item, (next) => {
+          onChange(list.map((current, currentIndex) => currentIndex === index ? next : current));
+        }, `${label} item ${index + 1}`, readOnly);
+        const remove = itemEl.createEl("button", { text: "Remove" });
+        remove.disabled = readOnly || list.length <= (typeof schema.minItems === "number" ? schema.minItems : 0);
+        remove.onclick = () => onChange(list.filter((_, currentIndex) => currentIndex !== index));
+      }
+      const add = container.createEl("button", { text: `Add ${label.toLowerCase()} item` });
+      add.disabled = readOnly || (typeof schema.maxItems === "number" && list.length >= schema.maxItems);
+      add.onclick = () => onChange([...list, schemaInitialValue(itemsSchema)]);
+      return;
+    }
+    if (type === "object") {
+      this.renderContractSchemaValue(container, schema, value, onChange, label, readOnly);
+      return;
+    }
+    if (type === "boolean") {
+      const checkbox = container.createEl("input", { type: "checkbox" });
+      checkbox.checked = value === true;
+      checkbox.disabled = readOnly;
+      checkbox.setAttr("aria-label", label);
+      checkbox.onchange = () => onChange(checkbox.checked);
+      return;
+    }
+    const input = container.createEl("input", { type: type === "number" || type === "integer" ? "number" : "text" });
+    input.setAttr("aria-label", label);
+    input.value = value === undefined || value === null ? "" : String(value);
+    input.disabled = readOnly;
+    input.oninput = () => onChange(type === "number" || type === "integer" ? Number(input.value) : input.value);
   }
 
   private renderFieldRow(container: HTMLElement, field: TypeEditorField, index: number, readOnly: boolean): void {
@@ -619,14 +1196,37 @@ export class MdbaseWorkspaceView extends ItemView {
       depth: number;
     },
   ): void {
-    const node = container.createDiv({ cls: "mdbase-field-node" });
+    const node = container.createEl("details", { cls: "mdbase-field-node" });
     node.setAttr("data-depth", String(options.depth));
+    const fieldId = this.fieldId(definition);
+    const queryMatch = Boolean(this.fieldQuery.trim())
+      && this.fieldMatches(
+        options.name ?? options.staticLabel ?? "",
+        definition,
+        this.fieldQuery.trim().toLowerCase(),
+      );
+    node.open = this.expandedFields.has(fieldId) || queryMatch;
+    node.ontoggle = () => {
+      if (node.open) this.expandedFields.add(fieldId);
+      else this.expandedFields.delete(fieldId);
+    };
+    const summary = node.createEl("summary", { cls: "mdbase-field-summary" });
+    summary.createSpan({
+      cls: "mdbase-field-summary-name",
+      text: options.name || options.staticLabel || "Unnamed field",
+    });
+    summary.createSpan({ cls: "mdbase-field-summary-type", text: definitionType(definition) });
+    summary.createSpan({
+      cls: "mdbase-field-summary-rule",
+      text: options.required ? "Required" : options.staticLabel ? "Item shape" : "Optional",
+    });
     const row = node.createDiv({ cls: "mdbase-field-row" });
 
     if (options.staticLabel) {
       row.createDiv({ cls: "mdbase-field-role", text: options.staticLabel });
     } else {
       const name = row.createEl("input", { type: "text", cls: "mdbase-field-name-control" });
+      name.setAttr("data-focus-key", `field-${fieldId}-name`);
       name.setAttr("aria-label", options.nameLabel);
       name.placeholder = "fieldName";
       name.value = options.name ?? "";
@@ -636,6 +1236,7 @@ export class MdbaseWorkspaceView extends ItemView {
     }
 
     const type = row.createEl("select", { cls: "mdbase-field-type-control" });
+    type.setAttr("data-focus-key", `field-${fieldId}-type`);
     type.setAttr("aria-label", `${options.name || options.staticLabel || "Field"} type`);
     for (const value of FIELD_TYPES) {
       const label = value === "any" ? "Any value" : value[0].toUpperCase() + value.slice(1);
@@ -658,6 +1259,7 @@ export class MdbaseWorkspaceView extends ItemView {
     };
 
     const description = row.createEl("input", { type: "text", cls: "mdbase-field-description-control" });
+    description.setAttr("data-focus-key", `field-${fieldId}-description`);
     description.setAttr("aria-label", `${options.name || options.staticLabel || "Field"} description`);
     description.placeholder = "Description";
     description.value = typeof definition.description === "string" ? definition.description : "";
@@ -671,6 +1273,7 @@ export class MdbaseWorkspaceView extends ItemView {
     if (options.onRequiredChange) {
       const required = row.createEl("label", { cls: "mdbase-field-required" });
       const checkbox = required.createEl("input", { type: "checkbox" });
+      checkbox.setAttr("data-focus-key", `field-${fieldId}-required`);
       checkbox.checked = options.required === true;
       checkbox.disabled = options.readOnly;
       checkbox.onchange = () => options.onRequiredChange?.(checkbox.checked);
@@ -690,6 +1293,27 @@ export class MdbaseWorkspaceView extends ItemView {
     if (typeName === "link") this.renderLinkFieldDetails(node, definition, options);
     if (typeName === "list") this.renderListFieldDetails(node, definition, options);
     if (typeName === "object") this.renderObjectFieldDetails(node, definition, options);
+  }
+
+  private fieldId(definition: Record<string, unknown>): string {
+    const existing = this.fieldIds.get(definition);
+    if (existing) return existing;
+    const id = `field-${this.nextFieldId}`;
+    this.nextFieldId += 1;
+    this.fieldIds.set(definition, id);
+    return id;
+  }
+
+  private fieldMatches(name: string, definition: Record<string, unknown>, query: string): boolean {
+    const own = `${name} ${definitionType(definition)} ${typeof definition.description === "string" ? definition.description : ""}`
+      .toLowerCase();
+    if (own.includes(query)) return true;
+    if (isRecord(definition.items) && this.fieldMatches("item", definition.items, query)) return true;
+    if (isRecord(definition.fields)) {
+      return Object.entries(definition.fields).some(([childName, child]) =>
+        isRecord(child) && this.fieldMatches(childName, child, query));
+    }
+    return false;
   }
 
   private renderEnumFieldDetails(
@@ -718,13 +1342,18 @@ export class MdbaseWorkspaceView extends ItemView {
   ): void {
     const details = node.createDiv({ cls: "mdbase-field-details mdbase-field-options" });
     const targetLabel = details.createEl("label", { text: "Target type" });
-    const target = details.createEl("input", { type: "text" });
+    const target = details.createEl("select");
     target.setAttr("aria-label", `${options.name || options.staticLabel || "Link"} target type`);
-    target.placeholder = "Any type";
-    target.value = typeof definition.target === "string" ? definition.target : "";
+    target.createEl("option", { value: "", text: "Any type" });
+    const currentTarget = typeof definition.target === "string" ? definition.target : "";
+    for (const type of this.typeEntries()) target.createEl("option", { value: type.name, text: type.name });
+    if (currentTarget && !this.typeEntries().some((type) => type.name === currentTarget)) {
+      target.createEl("option", { value: currentTarget, text: `${currentTarget} · missing` });
+    }
+    target.value = currentTarget;
     target.disabled = options.readOnly;
-    target.oninput = () => {
-      if (target.value.trim()) definition.target = target.value.trim();
+    target.onchange = () => {
+      if (target.value) definition.target = target.value;
       else delete definition.target;
       this.markDirty();
     };
@@ -830,6 +1459,7 @@ export class MdbaseWorkspaceView extends ItemView {
     });
     const textarea = section.createEl("textarea", { cls: "mdbase-yaml-editor" });
     textarea.setAttr("aria-label", "Type definition YAML");
+    textarea.setAttr("data-focus-key", "yaml-editor");
     textarea.value = this.yamlDraft;
     textarea.disabled = readOnly;
     textarea.spellcheck = false;
@@ -843,61 +1473,189 @@ export class MdbaseWorkspaceView extends ItemView {
     const document = container.createDiv({ cls: "mdbase-sync-document" });
     const header = document.createDiv({ cls: "mdbase-document-header" });
     header.createEl("h2", { text: "Sync" });
-    header.createEl("p", { text: "Connect this vault to a collection authority and keep ordinary Markdown mirrored locally." });
+    header.createEl("p", { text: "A clear handoff between this vault and its hosted collection authority." });
     const profile = this.host.getMirrorProfile();
     if (!profile) {
       this.renderEnrollment(document);
       return;
     }
-    const status = document.createEl("section", { cls: "mdbase-editor-section" });
-    status.createEl("h3", { text: "Collection authority" });
-    const values = status.createDiv({ cls: "mdbase-status-list" });
-    renderStatus(values, "Name", profile.name);
-    renderStatus(values, "Collection", profile.collectionId);
-    renderStatus(values, "Access", profile.mode === "read_write" ? "Read and write" : "Read only");
-    renderStatus(values, "Provider", profile.syncUrl);
-    renderStatus(values, "State", this.mirrorStatus?.state.replace(/_/g, " ") ?? "Checking");
-    renderStatus(values, "Last synced", this.mirrorStatus?.last_synced_at ?? "Never");
+
+    const status = document.createEl("section", { cls: "mdbase-sync-hero" });
+    status.setAttr("data-state", this.mirrorStatus?.state ?? "checking");
+    const route = status.createDiv({ cls: "mdbase-sync-route" });
+    const local = route.createDiv({ cls: "mdbase-sync-endpoint" });
+    setIcon(local.createSpan({ cls: "mdbase-sync-endpoint-icon" }), "vault");
+    const localText = local.createDiv();
+    localText.createEl("strong", { text: "This Obsidian vault" });
+    const filePolicy = profile.selectiveSync ?? { file_classes: [], excluded_folders: [] };
+    const fileSummary = filePolicy.file_classes.length
+      ? `Markdown + ${filePolicy.file_classes.join(", ")}`
+      : "Markdown only";
+    localText.createSpan({ text: `${profile.mode === "read_write" ? "Upload and download" : "Downloads only"} · ${fileSummary}` });
+    const connection = route.createDiv({ cls: "mdbase-sync-connection" });
+    setIcon(connection.createSpan(), profile.mode === "read_write" ? "arrow-left-right" : "arrow-left");
+    connection.createSpan({ text: syncStateLabel(this.mirrorStatus) });
+    const hosted = route.createDiv({ cls: "mdbase-sync-endpoint" });
+    setIcon(hosted.createSpan({ cls: "mdbase-sync-endpoint-icon" }), "cloud");
+    const hostedText = hosted.createDiv();
+    hostedText.createEl("strong", { text: profile.name });
+    hostedText.createSpan({ text: "Hosted authority" });
+
+    const meta = status.createDiv({ cls: "mdbase-sync-meta" });
+    const pendingFiles = this.mirrorStatus?.pending_files ?? 0;
+    meta.createSpan({
+      text: `${profile.mode === "read_write" ? "Read–write mirror" : "Read-only mirror"} · ${relativeTime(this.mirrorStatus?.last_synced_at)}${pendingFiles ? ` · ${pendingFiles} queued ${pendingFiles === 1 ? "file" : "files"}` : ""}`,
+    });
+    const identity = meta.createEl("code", { text: profile.collectionId });
+    identity.setAttr("title", "Collection ID");
+
     if (this.mirrorProgress) {
+      const progressArea = status.createDiv({ cls: "mdbase-sync-progress", attr: { "aria-live": "polite" } });
       const total = this.mirrorProgress.total;
-      const progress = status.createEl("progress");
+      const progress = progressArea.createEl("progress");
       progress.max = total ?? 1;
       progress.value = total == null ? 0 : this.mirrorProgress.completed;
       if (total == null) progress.removeAttribute("value");
-      status.createDiv({
+      progressArea.createDiv({
         cls: "mdbase-progress-label",
-        text: `${this.mirrorProgress.phase}: ${this.mirrorProgress.completed}${total == null ? "" : ` of ${total}`}`,
+        text: `${this.mirrorProgress.phase === "uploading"
+          ? "Uploading local changes"
+          : this.mirrorProgress.phase === "downloading"
+            ? "Downloading collection files"
+            : "Applying hosted changes"} · ${this.mirrorProgress.completed}${total == null ? "" : ` of ${total}`}`,
       });
+      const cancel = progressArea.createEl("button", { text: "Stop safely" });
+      cancel.onclick = () => {
+        this.host.connectSync.cancelSync();
+        this.transientMessage = "Stopping after the current network request…";
+        this.render();
+      };
     }
-    const actions = status.createDiv({ cls: "mdbase-actions" });
-    const preview = actions.createEl("button", { text: "Preview" });
+
+    const actions = status.createDiv({ cls: "mdbase-sync-actions" });
+    const preview = actions.createEl("button", { text: this.mirrorPreview ? "Refresh review" : "Review changes" });
     preview.disabled = this.busy;
     preview.onclick = () => void this.perform(async () => {
       this.mirrorPreview = await this.host.connectSync.preview();
+      this.transientMessage = this.mirrorPreview.entries.length
+        ? "Review each transfer below, then sync when ready."
+        : "This vault and the hosted collection are already aligned.";
       this.render();
     });
-    const sync = actions.createEl("button", { text: "Sync now" });
-    sync.addClass("mod-cta");
-    sync.disabled = this.busy;
-    sync.onclick = () => void this.perform(async () => {
-      this.mirrorStatus = await this.host.connectSync.sync((progress) => {
-        this.mirrorProgress = progress;
-        this.render();
-      });
-      this.mirrorProgress = null;
-      this.transientMessage = "Sync completed and the local checkpoint was verified.";
-      await this.refresh(true);
+    const transferCount = this.mirrorPreview
+      ? this.mirrorPreview.entries.filter((entry) => entry.direction !== "attention").length
+      : 0;
+    const hasBlockingCollision = (this.mirrorPreview?.collisions.length ?? 0) > 0;
+    const sync = actions.createEl("button", {
+      text: this.mirrorPreview
+        ? transferCount
+          ? `Sync ${transferCount} ${transferCount === 1 ? "change" : "changes"}`
+          : "No changes to sync"
+        : "Review before syncing",
     });
+    sync.addClass("mod-cta");
+    sync.disabled = this.busy || !this.mirrorPreview || transferCount === 0 || hasBlockingCollision;
+    sync.onclick = () => void this.perform(async () => {
+      try {
+        const reviewed = this.mirrorPreview!;
+        const latest = await this.host.connectSync.preview();
+        if (syncPreviewSignature(latest) !== syncPreviewSignature(reviewed)) {
+          this.mirrorPreview = latest;
+          this.transientMessage = "The transfer plan changed since your review. Review the updated items before syncing.";
+          return;
+        }
+        this.mirrorStatus = await this.host.connectSync.sync((progress) => {
+          this.mirrorProgress = progress;
+          this.render();
+        });
+        this.mirrorPreview = await this.host.connectSync.preview();
+        this.transientMessage = "Sync complete. The local checkpoint matches the hosted authority.";
+        await this.refresh(true);
+      } catch (error) {
+        if (!isAbortError(error)) throw error;
+        this.transientMessage = "Sync stopped safely. Every completed change remains checkpointed; review again before resuming.";
+      } finally {
+        this.mirrorProgress = null;
+      }
+    });
+
+    this.renderFilePolicyControls(document, { connected: true });
 
     if (this.mirrorPreview) this.renderMirrorPreview(document, this.mirrorPreview);
     if (this.mirrorStatus?.conflicts.length) this.renderConflicts(document, this.mirrorStatus);
+    if (this.mirrorStatus?.file_conflicts?.length) this.renderFileConflicts(document, this.mirrorStatus);
     if (this.mirrorStatus?.local_issues.length) {
       this.renderLocalMirrorIssues(document, this.mirrorStatus);
     }
     const guidance = document.createEl("section", { cls: "mdbase-editor-section" });
     guidance.createEl("h3", { text: "Mirror ownership" });
     guidance.createEl("p", {
-      text: "Use this plugin as the only sync owner for this vault. Obsidian protects concurrent operations inside the app; a separate desktop mirror process cannot share that mobile-safe lease.",
+      text: "Let this plugin be the only sync owner for this vault. It checkpoints every completed operation and protects concurrent sync inside Obsidian.",
+    });
+  }
+
+  private filePolicy(): SelectiveSyncPolicy {
+    this.filePolicyDraft ??= JSON.parse(JSON.stringify(this.host.connectSync.getSelectiveSync())) as SelectiveSyncPolicy;
+    return this.filePolicyDraft;
+  }
+
+  private renderFilePolicyControls(
+    container: HTMLElement,
+    options: { connected: boolean },
+  ): void {
+    const policy = this.filePolicy();
+    const section = container.createEl("section", { cls: "mdbase-editor-section mdbase-file-policy" });
+    section.createEl("h3", { text: options.connected ? "Files on this device" : "Collection files" });
+    section.createEl("p", {
+      text: "Markdown always syncs. Choose which binary file classes this device should materialize; hidden and reserved paths remain excluded.",
+    });
+    const choices = section.createDiv({ cls: "mdbase-file-class-grid" });
+    const labels: Array<[FileMediaClass, string]> = [
+      ["image", "Images"],
+      ["audio", "Audio"],
+      ["video", "Video"],
+      ["pdf", "PDFs"],
+      ["other", "Other files"],
+    ];
+    for (const [value, label] of labels) {
+      const choice = choices.createEl("label");
+      const checkbox = choice.createEl("input", { type: "checkbox" });
+      checkbox.setAttr("data-focus-key", `file-class-${value}`);
+      checkbox.checked = policy.file_classes.includes(value);
+      checkbox.onchange = () => {
+        policy.file_classes = checkbox.checked
+          ? [...new Set([...policy.file_classes, value])]
+          : policy.file_classes.filter((entry) => entry !== value);
+        this.render();
+      };
+      choice.createSpan({ text: label });
+    }
+    inputRow(section, "Excluded folders", policy.excluded_folders.join(", "), (value) => {
+      policy.excluded_folders = value.split(",").map((entry) => entry.trim()).filter(Boolean);
+    }, {
+      description: "Comma-separated collection-relative folders. Exclusions apply to Markdown and binary files on this device.",
+      placeholder: "Archive, Private exports",
+    });
+    if (!policy.file_classes.length) {
+      section.createDiv({ cls: "mdbase-inline-message", text: "Binary sync is off. This mirror remains Markdown-only." });
+    } else if (policy.file_classes.includes("other")) {
+      section.createDiv({
+        cls: "mdbase-inline-message",
+        text: "Other files includes every eligible visible non-Markdown format. Review the transfer ledger carefully before syncing.",
+      });
+    }
+    if (!options.connected) return;
+    const current = this.host.connectSync.getSelectiveSync();
+    const changed = JSON.stringify(current) !== JSON.stringify(policy);
+    const actions = section.createDiv({ cls: "mdbase-actions" });
+    const apply = actions.createEl("button", { text: changed ? "Apply file policy" : "File policy applied" });
+    apply.disabled = !changed || this.busy;
+    apply.onclick = () => void this.perform(async () => {
+      await this.host.connectSync.configureSelectiveSync(policy);
+      this.filePolicyDraft = null;
+      this.mirrorPreview = null;
+      this.transientMessage = "File policy updated. Review the rebuild before files move.";
+      this.render();
     });
   }
 
@@ -907,43 +1665,46 @@ export class MdbaseWorkspaceView extends ItemView {
       return;
     }
     const section = container.createEl("section", { cls: "mdbase-editor-section mdbase-enrollment" });
-    section.createEl("h3", { text: "Connect collection authority" });
+    section.createEl("h3", { text: "Connect an empty vault" });
     section.createEl("p", {
-      text: "Connect will open an approval page. Credentials are stored in Obsidian's secret store and never written into this vault.",
+      text: "Choose access, approve it in Connect, then review the first transfer before any files move.",
     });
+    this.renderEnrollmentSteps(section, this.enrollmentVerification ? 2 : this.enrollmentAbort ? 2 : 1, [
+      "Choose connection",
+      "Approve in Connect",
+      "Review first sync",
+    ]);
     if (this.enrollmentVerification) {
       const approval = section.createDiv({ cls: "mdbase-approval-link" });
-      approval.createSpan({ text: "Approval page: " });
+      approval.createSpan({ text: "Waiting for approval · " });
       const link = approval.createEl("a", {
-        text: "Open Connect",
+        text: "Open approval page again",
         href: this.enrollmentVerification,
       });
       link.setAttr("target", "_blank");
       link.setAttr("rel", "noopener noreferrer");
     }
-    let controlUrl = "https://connect.mdbase.dev";
-    let mirrorName = "Obsidian";
-    let collectionId = "";
-    let mode: "read_only" | "read_write" = "read_write";
-    inputRow(section, "Connect URL", controlUrl, (value) => {
-      controlUrl = value;
+    inputRow(section, "Connect URL", this.enrollmentControlUrl, (value) => {
+      this.enrollmentControlUrl = value;
     }, { placeholder: "https://connect.mdbase.dev" });
-    inputRow(section, "Mirror name", mirrorName, (value) => {
-      mirrorName = value;
+    inputRow(section, "Mirror name", this.enrollmentMirrorName, (value) => {
+      this.enrollmentMirrorName = value;
     });
-    inputRow(section, "Collection ID", collectionId, (value) => {
-      collectionId = value;
+    inputRow(section, "Collection ID", this.enrollmentCollectionId, (value) => {
+      this.enrollmentCollectionId = value;
     }, { description: "Optional. Leave blank to choose during approval." });
     const access = section.createDiv({ cls: "mdbase-form-row" });
     access.createEl("label", { text: "Access" });
     const select = access.createEl("select");
     select.createEl("option", { value: "read_write", text: "Read and write" });
     select.createEl("option", { value: "read_only", text: "Read only" });
-    select.value = mode;
+    select.value = this.enrollmentMode;
     select.onchange = () => {
-      mode = select.value === "read_only" ? "read_only" : "read_write";
+      this.enrollmentMode = select.value === "read_only" ? "read_only" : "read_write";
     };
-    const button = section.createEl("button", { text: "Open Connect approval" });
+    this.renderFilePolicyControls(section, { connected: false });
+    const enrollmentActions = section.createDiv({ cls: "mdbase-actions" });
+    const button = enrollmentActions.createEl("button", { text: this.enrollmentAbort ? "Waiting for approval…" : "Continue to approval" });
     button.addClass("mod-cta");
     button.disabled = this.busy;
     button.onclick = () => void this.perform(async () => {
@@ -952,10 +1713,11 @@ export class MdbaseWorkspaceView extends ItemView {
       this.enrollmentAbort = abort;
       try {
         await this.host.connectSync.enroll({
-          controlUrl,
-          mirrorName,
-          mode,
-          ...(collectionId.trim() ? { collectionId: collectionId.trim() } : {}),
+          controlUrl: this.enrollmentControlUrl,
+          mirrorName: this.enrollmentMirrorName,
+          mode: this.enrollmentMode,
+          selectiveSync: this.filePolicy(),
+          ...(this.enrollmentCollectionId.trim() ? { collectionId: this.enrollmentCollectionId.trim() } : {}),
         }, {
           signal: abort.signal,
           onVerification: (verification) => {
@@ -975,10 +1737,21 @@ export class MdbaseWorkspaceView extends ItemView {
         this.transientMessage = "Mirror enrolled. Preview before the first sync.";
         await this.refreshMirrorStatus();
         this.render();
+      } catch (error) {
+        if (!isAbortError(error)) throw error;
+        this.transientMessage = "Approval wait cancelled. No files were synchronized.";
       } finally {
         if (this.enrollmentAbort === abort) this.enrollmentAbort = null;
       }
     });
+    if (this.enrollmentAbort) {
+      const cancel = enrollmentActions.createEl("button", { text: "Stop waiting" });
+      cancel.onclick = () => {
+        this.enrollmentAbort?.abort();
+        this.transientMessage = "Approval wait cancelled. No files were synchronized.";
+        this.render();
+      };
+    }
   }
 
   private renderLocalAdoption(container: HTMLElement): void {
@@ -990,6 +1763,15 @@ export class MdbaseWorkspaceView extends ItemView {
         ? "This vault has a durable adoption checkpoint. Resume it without creating another hosted collection."
         : "Hosted mdbase will adopt an exact snapshot and become the collection authority. This vault will then continue as a read-write mirror.",
     });
+    const adoptionStep = checkpoint
+      ? ["waiting_for_approval", "uploading", "fenced", "activating", "adopted"].indexOf(checkpoint.phase) + 1
+      : 1;
+    this.renderEnrollmentSteps(section, Math.min(4, Math.max(1, adoptionStep)), [
+      "Approve move",
+      "Stage snapshot",
+      "Activate authority",
+      "Reconnect mirror",
+    ]);
     const verificationUri = this.enrollmentVerification || checkpoint?.session.verificationUri;
     if (verificationUri) {
       const approval = section.createDiv({ cls: "mdbase-approval-link" });
@@ -998,20 +1780,25 @@ export class MdbaseWorkspaceView extends ItemView {
       link.setAttr("target", "_blank");
       link.setAttr("rel", "noopener noreferrer");
     }
-    let controlUrl = checkpoint?.session.controlUrl ?? "https://connect.mdbase.dev";
-    let mirrorName = checkpoint?.session.requested.mirrorName ?? "Obsidian";
+    if (checkpoint) {
+      this.enrollmentControlUrl = checkpoint.session.controlUrl;
+      this.enrollmentMirrorName = checkpoint.session.requested.mirrorName ?? "Obsidian";
+    }
     if (!checkpoint) {
-      inputRow(section, "Connect URL", controlUrl, (value) => {
-        controlUrl = value;
+      inputRow(section, "Connect URL", this.enrollmentControlUrl, (value) => {
+        this.enrollmentControlUrl = value;
       }, { placeholder: "https://connect.mdbase.dev" });
-      inputRow(section, "Mirror name", mirrorName, (value) => {
-        mirrorName = value;
+      inputRow(section, "Mirror name", this.enrollmentMirrorName, (value) => {
+        this.enrollmentMirrorName = value;
       });
+      this.renderFilePolicyControls(section, { connected: false });
     } else {
       const values = section.createDiv({ cls: "mdbase-status-list" });
       renderStatus(values, "Collection", checkpoint.session.requested.collectionId);
       renderStatus(values, "Phase", checkpoint.phase.replace(/_/g, " "));
       renderStatus(values, "Connect", checkpoint.session.controlUrl);
+      const policy = this.host.connectSync.getSelectiveSync();
+      renderStatus(values, "Files", policy.file_classes.length ? policy.file_classes.join(", ") : "Markdown only");
     }
     const warning = section.createDiv({ cls: "mdbase-inline-message" });
     warning.createEl("strong", { text: "Authority cut-over: " });
@@ -1038,30 +1825,49 @@ export class MdbaseWorkspaceView extends ItemView {
           : `Connect is retrying (attempt ${status.attempt}).`;
         this.render();
       };
+      const onFileProgress = (path: string, transferredBytes: number, totalBytes: number) => {
+        this.adoptionFileProgress = `${path} · ${formatBytes(transferredBytes)} of ${formatBytes(totalBytes)}`;
+        this.transientMessage = `Uploading collection file ${this.adoptionFileProgress}`;
+        this.render();
+      };
       try {
         if (checkpoint) {
           await this.host.connectSync.resumeAdoption({
             signal: abort.signal,
             onVerification,
             onStatus,
+            onFileProgress,
           });
         } else {
           await this.host.connectSync.adoptLocalCollection({
-            controlUrl,
-            mirrorName,
+            controlUrl: this.enrollmentControlUrl,
+            mirrorName: this.enrollmentMirrorName,
+            selectiveSync: this.filePolicy(),
           }, {
             signal: abort.signal,
             onVerification,
             onStatus,
+            onFileProgress,
           });
         }
         this.enrollmentVerification = "";
         this.transientMessage = "Hosted mdbase is authoritative and this vault is now its read-write mirror.";
         await this.refresh(true);
+      } catch (error) {
+        if (!isAbortError(error)) throw error;
+        this.transientMessage = "Paused safely. Use Resume adoption to continue from the durable checkpoint.";
       } finally {
         if (this.enrollmentAbort === abort) this.enrollmentAbort = null;
       }
     });
+    if (this.enrollmentAbort) {
+      const stop = section.createEl("button", { text: "Stop waiting" });
+      stop.onclick = () => {
+        this.enrollmentAbort?.abort();
+        this.transientMessage = "Paused safely. Use Resume adoption to continue from the durable checkpoint.";
+        this.render();
+      };
+    }
     if (checkpoint && !["activating", "adopted"].includes(checkpoint.phase)) {
       const cancel = section.createEl("button", { text: "Cancel adoption" });
       cancel.disabled = this.busy;
@@ -1074,30 +1880,85 @@ export class MdbaseWorkspaceView extends ItemView {
     }
   }
 
-  private renderMirrorPreview(container: HTMLElement, preview: MirrorInitializationPreview): void {
-    const section = container.createEl("section", { cls: "mdbase-editor-section" });
-    section.createEl("h3", { text: "Sync preview" });
-    const values = section.createDiv({ cls: "mdbase-status-list" });
-    renderStatus(values, "Download documents", String(preview.download_documents));
-    renderStatus(values, "Upload documents", String(preview.upload_documents));
-    renderStatus(values, "Unchanged documents", String(preview.unchanged_documents));
+  private renderEnrollmentSteps(container: HTMLElement, active: number, steps: readonly string[]): void {
+    const list = container.createEl("ol", { cls: "mdbase-enrollment-steps" });
+    steps.forEach((label, index) => {
+      const item = list.createEl("li");
+      const step = index + 1;
+      item.toggleClass("is-complete", step < active);
+      item.toggleClass("is-active", step === active);
+      item.createSpan({ text: String(step), cls: "mdbase-enrollment-step-number" });
+      item.createSpan({ text: label });
+      if (step === active) item.setAttr("aria-current", "step");
+    });
+  }
+
+  private renderMirrorPreview(container: HTMLElement, preview: MdbaseSyncPreview): void {
+    const section = container.createEl("section", { cls: "mdbase-transfer-review" });
+    const heading = section.createDiv({ cls: "mdbase-transfer-heading" });
+    const title = heading.createDiv();
+    title.createEl("h3", { text: preview.phase === "rebuild" ? "Rebuild review" : "Transfer review" });
+    title.createEl("p", {
+      text: preview.phase === "initial"
+        ? "First sync establishes the local checkpoint shown below."
+        : preview.phase === "rebuild"
+          ? "The hosted history changed; this mirror needs a fresh, reviewable baseline."
+          : `Compared local checkpoint ${preview.cursor ?? "—"} with hosted head ${preview.remoteHead ?? "—"}.`,
+    });
+    heading.createSpan({
+      cls: "mdbase-transfer-total",
+      text: `${preview.entries.length} ${preview.entries.length === 1 ? "item" : "items"} · ${preview.entries.filter((entry) => entry.kind === "file").length} files`,
+    });
+
+    const groups: Array<{ direction: SyncPreviewDirection; title: string; empty: string }> = [
+      { direction: "download", title: "Download to this vault", empty: "No hosted changes to download." },
+      { direction: "upload", title: "Upload to hosted", empty: "No local changes to upload." },
+      { direction: "attention", title: "Needs attention", empty: "Nothing is blocking or excluded." },
+    ];
+    for (const group of groups) {
+      const entries = preview.entries.filter((entry) => entry.direction === group.direction);
+      if (!entries.length && group.direction !== "attention") continue;
+      const block = section.createEl("section", { cls: "mdbase-transfer-group" });
+      block.setAttr("data-direction", group.direction);
+      const groupHeading = block.createDiv({ cls: "mdbase-transfer-group-heading" });
+      const icon = groupHeading.createSpan({ cls: "mdbase-transfer-group-icon" });
+      setIcon(icon, group.direction === "download" ? "download" : group.direction === "upload" ? "upload" : "circle-alert");
+      groupHeading.createEl("h4", { text: group.title });
+      groupHeading.createSpan({ text: String(entries.length), cls: "mdbase-transfer-count" });
+      if (!entries.length) {
+        block.createDiv({ cls: "mdbase-transfer-empty", text: group.empty });
+        continue;
+      }
+      const ledger = block.createDiv({ cls: "mdbase-transfer-ledger" });
+      for (const entry of entries.slice(0, 250)) {
+        const row = ledger.createDiv({ cls: "mdbase-transfer-row" });
+        const action = row.createSpan({ cls: "mdbase-transfer-action", text: entry.action });
+        action.setAttr("data-action", entry.action);
+        const body = row.createDiv({ cls: "mdbase-transfer-body" });
+        const pathLine = body.createDiv({ cls: "mdbase-transfer-path" });
+        pathLine.createEl("code", { text: entry.path });
+        pathLine.createSpan({ cls: "mdbase-transfer-kind", text: entry.kind === "file" ? "File" : "Markdown" });
+        body.createDiv({ text: entry.detail });
+        if (entry.direction === "attention") {
+          const open = row.createEl("button", { text: "Open" });
+          open.onclick = () => void this.host.openFileByPath(entry.path);
+        }
+      }
+      if (entries.length > 250) {
+        ledger.createDiv({ cls: "mdbase-transfer-more", text: `${entries.length - 250} more items are included in this transfer.` });
+      }
+    }
+
     if (preview.collisions.length) {
       section.createDiv({
         cls: "mdbase-inline-error",
-        text: `${preview.collisions.length} path collision${preview.collisions.length === 1 ? "" : "s"} must be resolved before sync.`,
+        text: "Resolve path collisions before the first sync. Existing local files are never overwritten without review.",
       });
-      const list = section.createEl("ul");
-      for (const path of preview.collisions.slice(0, 100)) list.createEl("li", { text: path });
-    }
-    if (preview.local_issues.length) {
+    } else if (preview.local_issues.length) {
       section.createDiv({
-        cls: "mdbase-inline-error",
-        text: `${preview.local_issues.length} local file${preview.local_issues.length === 1 ? "" : "s"} cannot be uploaded until its frontmatter is fixed.`,
+        cls: "mdbase-inline-message",
+        text: "Invalid local files stay untouched and unsynced; valid changes can continue.",
       });
-      const list = section.createEl("ul");
-      for (const issue of preview.local_issues.slice(0, 100)) {
-        list.createEl("li", { text: `${issue.path}: ${issue.message}` });
-      }
     }
   }
 
@@ -1118,6 +1979,28 @@ export class MdbaseWorkspaceView extends ItemView {
         button.onclick = () => void this.perform(async () => {
           this.mirrorStatus = await this.host.connectSync.resolveConflict(conflict.record_id, resolution);
           this.render();
+        });
+      }
+    }
+  }
+
+  private renderFileConflicts(container: HTMLElement, status: MirrorStatus): void {
+    const section = container.createEl("section", { cls: "mdbase-editor-section" });
+    section.createEl("h3", { text: "File conflicts" });
+    section.createEl("p", { text: "Binary bytes are never merged. Choose which complete file should become authoritative." });
+    for (const conflict of status.file_conflicts) {
+      const row = section.createDiv({ cls: "mdbase-conflict-row" });
+      const text = row.createDiv();
+      text.createEl("strong", { text: conflict.path });
+      text.createDiv({ text: conflict.message });
+      const actions = row.createDiv({ cls: "mdbase-actions" });
+      for (const resolution of ["local", "remote"] as const) {
+        const button = actions.createEl("button", { text: resolution === "local" ? "Keep local file" : "Use hosted file" });
+        button.disabled = this.busy;
+        button.onclick = () => void this.perform(async () => {
+          this.mirrorStatus = await this.host.connectSync.resolveFileConflict(conflict.file_id, resolution);
+          this.mirrorPreview = null;
+          this.transientMessage = "File conflict resolved. Review the updated transfer plan.";
         });
       }
     }
@@ -1173,6 +2056,7 @@ export class MdbaseWorkspaceView extends ItemView {
     };
     const query = controls.createEl("input", { type: "search" });
     query.setAttr("aria-label", "Filter issues");
+    query.setAttr("data-focus-key", "issue-search");
     query.placeholder = "Filter by path, code, field, or message";
     query.value = this.issueQuery;
     query.oninput = () => {
@@ -1215,9 +2099,8 @@ export class MdbaseWorkspaceView extends ItemView {
         text: `${fileIssues.length} ${fileIssues.length === 1 ? "issue" : "issues"}`,
       });
       for (const issue of fileIssues) {
-        const row = group.createEl("button", { cls: "mdbase-issue-row" });
+        const row = group.createDiv({ cls: "mdbase-issue-row" });
         row.setAttr("data-severity", issue.severity);
-        row.setAttr("aria-label", `${issue.severity === "warn" ? "Warning" : "Error"}: ${issue.message}`);
         row.createSpan({ cls: "mdbase-issue-indicator" }).setAttr("aria-hidden", "true");
         const metadata = row.createDiv({ cls: "mdbase-issue-metadata" });
         metadata.createEl("code", { text: issue.code });
@@ -1226,7 +2109,18 @@ export class MdbaseWorkspaceView extends ItemView {
           text: `${issue.severity === "warn" ? "Warning" : "Error"}${issue.field ? ` · ${issue.field}` : ""}`,
         });
         row.createDiv({ cls: "mdbase-issue-row-message", text: issue.message });
-        row.onclick = () => void this.host.openFileByPath(issue.path, issue.field);
+        const actions = row.createDiv({ cls: "mdbase-issue-row-actions" });
+        const open = actions.createEl("button", { text: issue.field ? "Open field" : "Open file" });
+        open.setAttr("aria-label", `Open ${issue.path}${issue.field ? ` at ${issue.field}` : ""}`);
+        open.onclick = () => void this.host.openFileByPath(issue.path, issue.field);
+        const quickFixLabel = this.host.getQuickFixLabel(issue);
+        if (quickFixLabel) {
+          const fix = actions.createEl("button", { text: quickFixLabel });
+          fix.addClass("mod-cta");
+          fix.onclick = () => void this.perform(async () => {
+            await this.host.applyQuickFix(issue);
+          });
+        }
       }
     }
     if (filtered.length > issues.length) {
@@ -1246,13 +2140,24 @@ export class MdbaseWorkspaceView extends ItemView {
       new Notice("Save or discard the current type changes before switching.");
       return;
     }
-    const model = await this.host.loadTypeModel(path);
+    const sourceModel = await this.host.loadTypeModel(path);
+    const draft = this.host.loadTypeDraft(path);
+    const canRestore = draft?.version === 1 && draft.sourceRevision === (sourceModel.sourceRevision ?? null);
+    const model = canRestore ? clone(draft.model) : sourceModel;
     this.selectedPath = path;
     this.model = model;
-    this.originalModel = clone(model);
-    this.yamlDraft = `${formatMarkdown(frontmatterFromReadableModel(model), model.body)}\n`;
-    this.dirty = false;
-    this.editorMode = "design";
+    this.originalModel = clone(sourceModel);
+    this.yamlDraft = canRestore && draft.yamlDraft
+      ? draft.yamlDraft
+      : `${formatMarkdown(frontmatterFromReadableModel(model), model.body)}\n`;
+    this.dirty = !typeModelsEqual(this.originalModel, model);
+    this.editorMode = canRestore && draft.editorMode === "yaml" ? "yaml" : "design";
+    if (this.editorMode === "yaml") this.dirty = true;
+    if (canRestore && this.dirty) {
+      this.transientMessage = `Recovered unsaved changes for ${path}.`;
+    } else if (draft && !canRestore) {
+      this.transientMessage = `An older draft for ${path} was kept, but the source changed. The current file is shown.`;
+    }
     this.render();
   }
 
@@ -1261,13 +2166,16 @@ export class MdbaseWorkspaceView extends ItemView {
       new Notice("Save or discard the current type changes before creating another type.");
       return;
     }
-    const model = createDefaultTypeModel();
+    const draft = this.host.loadTypeDraft(null);
+    const model = draft?.version === 1 ? clone(draft.model) : createDefaultTypeModel();
     this.selectedPath = null;
     this.model = model;
     this.originalModel = null;
-    this.yamlDraft = `${formatMarkdown(frontmatterFromTypeModel(model), model.body)}\n`;
+    this.yamlDraft = draft?.yamlDraft
+      ?? "";
     this.dirty = true;
-    this.editorMode = "design";
+    if (draft) this.transientMessage = "Recovered an unsaved new type.";
+    this.editorMode = draft?.editorMode ?? "design";
     this.render();
   }
 
@@ -1309,12 +2217,28 @@ export class MdbaseWorkspaceView extends ItemView {
   private async saveCurrentType(): Promise<void> {
     if (!this.model || this.model.specProfile !== "v0.3" || this.model.readOnlyReason) return;
     if (this.editorMode === "yaml" && !this.readYamlDraftIntoModel()) return;
-    if (!this.model.name.trim()) {
-      new Notice("Type name is required.");
+    const diagnostics = validateTypeDraft(this.model, {
+      knownTypes: this.typeEntries().map((type) => type.name),
+      contracts: this.schema?.contracts.values(),
+    });
+    const errors = diagnostics.filter((diagnostic) => diagnostic.severity === "error");
+    if (errors.length) {
+      this.transientMessage = `${errors.length} ${errors.length === 1 ? "error must" : "errors must"} be fixed before saving.`;
+      this.render();
+      new Notice(errors[0].message);
       return;
     }
+    const highImpact = describeTypeChanges(this.originalModel, this.model)
+      .filter((change) => change.risk === "high");
+    if (highImpact.length) {
+      const confirmed = await new TypeChangeConfirmationModal(this.app).confirm(highImpact);
+      if (!confirmed) return;
+    }
     await this.perform(async () => {
-      const file = await this.host.saveTypeModel(this.model!, this.selectedPath);
+      const previousPath = this.selectedPath;
+      const file = await this.host.saveTypeModel(this.model!, previousPath, this.originalModel?.sourceRevision);
+      await this.host.clearTypeDraft(previousPath);
+      if (previousPath !== file.path) await this.host.clearTypeDraft(file.path);
       this.selectedPath = file.path;
       this.originalModel = clone(this.model!);
       this.dirty = false;
@@ -1324,8 +2248,13 @@ export class MdbaseWorkspaceView extends ItemView {
   }
 
   private markDirty(render = false): void {
-    this.dirty = true;
-    if (render) {
+    const wasDirty = this.dirty;
+    this.dirty = this.editorMode === "yaml"
+      ? true
+      : !typeModelsEqual(this.originalModel, this.model);
+    this.scheduleTypeDraftSave();
+    if (this.dirty && !wasDirty) this.transientMessage = "";
+    if (render || wasDirty !== this.dirty) {
       this.render();
       return;
     }
@@ -1345,6 +2274,51 @@ export class MdbaseWorkspaceView extends ItemView {
       const empty = review.querySelector("p");
       if (empty) empty.setText("Pending changes. Review details after leaving the current field.");
     }
+  }
+
+  private scheduleTypeDraftSave(): void {
+    if (this.draftSaveTimer !== null) window.clearTimeout(this.draftSaveTimer);
+    this.draftSaveTimer = window.setTimeout(() => {
+      this.draftSaveTimer = null;
+      void this.flushTypeDraft();
+    }, 350);
+  }
+
+  private async flushTypeDraft(): Promise<void> {
+    if (this.draftSaveTimer !== null) {
+      window.clearTimeout(this.draftSaveTimer);
+      this.draftSaveTimer = null;
+    }
+    if (!this.model || !this.dirty) return;
+    const draft: StoredTypeDraft = {
+      version: 1,
+      path: this.selectedPath,
+      sourceRevision: this.originalModel?.sourceRevision ?? null,
+      model: clone(this.model),
+      editorMode: this.editorMode,
+      yamlDraft: this.editorMode === "yaml" ? this.yamlDraft : undefined,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.host.saveTypeDraft(draft);
+  }
+
+  private async discardCurrentType(): Promise<void> {
+    const path = this.selectedPath;
+    await this.host.clearTypeDraft(path);
+    if (path) {
+      const model = await this.host.loadTypeModel(path);
+      this.model = model;
+      this.originalModel = clone(model);
+      this.yamlDraft = `${formatMarkdown(frontmatterFromReadableModel(model), model.body)}\n`;
+      this.dirty = false;
+    } else {
+      this.model = null;
+      this.originalModel = null;
+      this.yamlDraft = "";
+      this.dirty = false;
+    }
+    this.transientMessage = "Unsaved changes discarded.";
+    this.render();
   }
 
   private async refreshMirrorStatus(): Promise<void> {

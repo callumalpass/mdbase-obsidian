@@ -4,8 +4,11 @@ import { performance } from "node:perf_hooks";
 import { test } from "node:test";
 import { normalizePath, TFile, TFolder } from "obsidian";
 import { MemoryAuthority } from "@mdbase-dev/connect-sync";
+import type { SyncTransport } from "@mdbase-dev/connect-sync";
+import type { CollectionFileDescriptor } from "@mdbase-dev/connect-protocol";
 import {
   DirectoryMirror,
+  MemoryMirrorBlobStore,
   MemoryMirrorLease,
   MemoryMirrorStateStore,
   WritableDirectoryMirror,
@@ -45,8 +48,39 @@ function sha256Revision(document: string): string {
   return `sha256:${createHash("sha256").update(document).digest("hex")}`;
 }
 
+function fileDescriptor(path: string, bytes: Uint8Array, fileId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"): CollectionFileDescriptor {
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  return {
+    file_id: fileId,
+    path,
+    revision: `file:${digest}`,
+    content_digest: `sha256:${digest}`,
+    size: bytes.byteLength,
+    media_class: path.endsWith(".png") ? "image" : "other",
+    media_type: path.endsWith(".png") ? "image/png" : "application/octet-stream",
+    modified_at: "2026-08-05T00:00:00.000Z",
+  };
+}
+
+async function collectBytes(source: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  for await (const chunk of source) {
+    chunks.push(Uint8Array.from(chunk));
+    length += chunk.byteLength;
+  }
+  const result = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
 class MemoryVault {
   readonly files = new Map<string, StoredFile>();
+  readonly binaryFiles = new Map<string, { file: TFile; content: ArrayBuffer }>();
   readonly folders = new Map<string, TFolder>();
   failTargetPath: string | null = null;
   failCreatePath: string | null = null;
@@ -56,7 +90,7 @@ class MemoryVault {
   adapter = {
     exists: async (path: string): Promise<boolean> => {
       const normalized = normalizePath(path);
-      return this.files.has(normalized) || this.folders.has(normalized);
+      return this.files.has(normalized) || this.binaryFiles.has(normalized) || this.folders.has(normalized);
     },
     read: async (path: string): Promise<string> => {
       const entry = this.files.get(normalizePath(path));
@@ -75,11 +109,18 @@ class MemoryVault {
 
   getAbstractFileByPath(path: string): TFile | TFolder | null {
     const normalized = normalizePath(path);
-    return this.files.get(normalized)?.file ?? this.folders.get(normalized) ?? null;
+    return this.files.get(normalized)?.file ?? this.binaryFiles.get(normalized)?.file ?? this.folders.get(normalized) ?? null;
   }
 
   getMarkdownFiles(): TFile[] {
     return [...this.files.values()].map((entry) => entry.file).filter((file) => file.extension === "md");
+  }
+
+  getFiles(): TFile[] {
+    return [
+      ...[...this.files.values()].map((entry) => entry.file),
+      ...[...this.binaryFiles.values()].map((entry) => entry.file),
+    ];
   }
 
   async cachedRead(file: TFile): Promise<string> {
@@ -115,6 +156,24 @@ class MemoryVault {
     this.files.set(file.path, { file, content });
   }
 
+  async readBinary(file: TFile): Promise<ArrayBuffer> {
+    const entry = this.binaryFiles.get(file.path);
+    if (!entry) throw new Error(`missing binary ${file.path}`);
+    return entry.content.slice(0);
+  }
+
+  async createBinary(path: string, content: ArrayBuffer): Promise<TFile> {
+    const normalized = normalizePath(path);
+    if (this.files.has(normalized) || this.binaryFiles.has(normalized) || this.folders.has(normalized)) throw new Error(`exists ${normalized}`);
+    const file = new TestFile(normalized);
+    this.binaryFiles.set(normalized, { file, content: content.slice(0) });
+    return file;
+  }
+
+  async modifyBinary(file: TFile, content: ArrayBuffer): Promise<void> {
+    this.binaryFiles.set(file.path, { file, content: content.slice(0) });
+  }
+
   async createFolder(path: string): Promise<void> {
     const normalized = normalizePath(path);
     if (!this.folders.has(normalized)) this.folders.set(normalized, new TestFolder(normalized));
@@ -122,10 +181,16 @@ class MemoryVault {
 
   async delete(file: TFile): Promise<void> {
     this.files.delete(file.path);
+    this.binaryFiles.delete(file.path);
   }
 
   read(path: string): string | null {
     return this.files.get(normalizePath(path))?.content ?? null;
+  }
+
+  readBytes(path: string): Uint8Array | null {
+    const content = this.binaryFiles.get(normalizePath(path))?.content;
+    return content ? new Uint8Array(content.slice(0)) : null;
   }
 }
 
@@ -797,6 +862,202 @@ test("portable mirror materializes resources and records through Obsidian Vault 
   assert.equal(vault.read("mdbase.yaml"), "spec_version: 0.3.0\n");
   assert.match(vault.read("_types/note.md") ?? "", /mdbase\.type/);
   assert.equal((await mirror.status()).state, "up_to_date");
+});
+
+test("Obsidian binary adapter preserves exact bytes and excludes unsafe collection paths", async () => {
+  const vault = new MemoryVault();
+  const adapter = new ObsidianMirrorFileSystem(vault as never);
+  const bytes = Uint8Array.from({ length: 1024 * 1024 + 37 }, (_, index) => index % 251);
+  await adapter.writeBinary("Attachments/exact.png", (async function* () {
+    yield bytes.subarray(0, 19);
+    yield new Uint8Array();
+    yield bytes.subarray(19);
+  })());
+  assert.deepEqual(vault.readBytes("Attachments/exact.png"), bytes);
+  const source = await adapter.readBinary("Attachments/exact.png");
+  assert.ok(source);
+  assert.deepEqual(await collectBytes(source), bytes);
+  assert.deepEqual(await adapter.inspectBinary("Attachments/exact.png"), {
+    size: bytes.byteLength,
+    content_digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+  });
+
+  await vault.createBinary(".obsidian/private.png", Uint8Array.of(1).buffer);
+  await vault.createBinary("Attachments/ignored.md", Uint8Array.of(2).buffer);
+  assert.deepEqual(await adapter.listBinary(new Set()), ["Attachments/exact.png"]);
+  await assert.rejects(adapter.writeBinary("../escape.png", (async function* () { yield bytes; })()), /safe relative|invalid|path/i);
+  await assert.rejects(adapter.writeBinary("CON.png", (async function* () { yield bytes; })()), /reserved|non-portable/i);
+});
+
+test("portable mirror downloads digest-verified binary files into the vault", async () => {
+  const hosted = new MemoryAuthority();
+  const replica = hosted.registerReplica({ name: "Binary reader", mode: "read_only" });
+  const base = hosted.transport(replica);
+  const bytes = Uint8Array.from([0, 255, 17, 42, 0, 128]);
+  const file = fileDescriptor("Attachments/pixel.png", bytes);
+  const transport: SyncTransport = {
+    ...base,
+    fileSnapshot: async (snapshotId, page) => ({
+      ...await base.fileSnapshot(snapshotId, page),
+      files: [file],
+    }),
+    downloadFile: async function* () {
+      yield bytes.subarray(0, 2);
+      yield bytes.subarray(2);
+    },
+  };
+  const vault = new MemoryVault();
+  const state = new MemoryMirrorStateStore();
+  const mirror = new DirectoryMirror(replica, transport, {
+    fileSystem: new ObsidianMirrorFileSystem(vault as never),
+    stateStore: state,
+    blobStore: new MemoryMirrorBlobStore(),
+    selectiveSync: { file_classes: ["image"], excluded_folders: [] },
+  });
+  const preview = await mirror.previewInitialization();
+  assert.equal(preview.download_files, 1);
+  await mirror.sync();
+  assert.deepEqual(vault.readBytes(file.path), bytes);
+  assert.equal((await mirror.status()).state, "up_to_date");
+  assert.equal((await state.read())?.files?.[file.file_id]?.file.content_digest, file.content_digest);
+});
+
+test("binary integrity failure leaves both the vault and mirror checkpoint untouched", async () => {
+  const hosted = new MemoryAuthority();
+  const replica = hosted.registerReplica({ name: "Corrupt binary", mode: "read_only" });
+  const base = hosted.transport(replica);
+  const expected = Uint8Array.of(1, 2, 3, 4);
+  const file = fileDescriptor("Media/corrupt.png", expected);
+  const transport: SyncTransport = {
+    ...base,
+    fileSnapshot: async (snapshotId, page) => ({
+      ...await base.fileSnapshot(snapshotId, page),
+      files: [file],
+    }),
+    downloadFile: async function* () { yield Uint8Array.of(1, 2, 3, 5); },
+  };
+  const vault = new MemoryVault();
+  const state = new MemoryMirrorStateStore();
+  const mirror = new DirectoryMirror(replica, transport, {
+    fileSystem: new ObsidianMirrorFileSystem(vault as never),
+    stateStore: state,
+    blobStore: new MemoryMirrorBlobStore(),
+    selectiveSync: { file_classes: ["image"], excluded_folders: [] },
+  });
+  await assert.rejects(mirror.sync(), /integrity|digest|verification/i);
+  assert.equal(vault.readBytes(file.path), null);
+  assert.equal(await state.read(), null);
+});
+
+test("portable mirror uploads new local binary files with exact bytes", async () => {
+  const hosted = new MemoryAuthority();
+  const replica = hosted.registerReplica({ name: "Binary writer", mode: "read_write" });
+  const base = hosted.transport(replica);
+  const bytes = Uint8Array.from([3, 1, 4, 1, 5, 9, 0, 255]);
+  let uploaded: Uint8Array | null = null;
+  let hostedFile: CollectionFileDescriptor | null = null;
+  const transport: SyncTransport = {
+    ...base,
+    fileSnapshot: async (snapshotId, page) => ({
+      ...await base.fileSnapshot(snapshotId, page),
+      files: hostedFile ? [hostedFile] : [],
+    }),
+    downloadFile: async function* () {
+      if (!hostedFile || !uploaded) throw new Error("missing hosted file");
+      yield uploaded;
+    },
+    uploadFile: async (request, source) => {
+      uploaded = await collectBytes(source);
+      hostedFile = {
+        ...fileDescriptor(request.path, uploaded, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+        content_digest: request.content_digest,
+        size: request.size,
+        ...(request.media_type ? { media_type: request.media_type } : {}),
+      };
+      return {
+        protocol_version: 1,
+        type: "file_upload_committed",
+        transfer_id: request.transfer_id,
+        file: hostedFile,
+      };
+    },
+  };
+  const vault = new MemoryVault();
+  await vault.createFolder("Media");
+  await vault.createBinary("Media/local.png", bytes.buffer);
+  const mirror = new WritableDirectoryMirror(replica, transport, {
+    fileSystem: new ObsidianMirrorFileSystem(vault as never),
+    stateStore: new MemoryMirrorStateStore(),
+    blobStore: new MemoryMirrorBlobStore(),
+    selectiveSync: { file_classes: ["image"], excluded_folders: [] },
+  });
+  const preview = await mirror.previewInitialization();
+  assert.equal(preview.upload_files, 1);
+  await mirror.sync();
+  assert.deepEqual(uploaded, bytes);
+  assert.equal((hostedFile as CollectionFileDescriptor | null)?.path, "Media/local.png");
+});
+
+test("Connect controller previews the exact first transfer and later local edits", async () => {
+  const hosted = new MemoryAuthority();
+  hosted.seed([{
+    record_id: "one",
+    path: "notes/one.md",
+    frontmatter: { type: "note", title: "One" },
+    body: "First",
+    types: ["note"],
+  }]);
+  const replicaId = hosted.registerReplica({ name: "Review ledger", mode: "read_write" });
+  const session = await hosted.transport(replicaId).openSession();
+  const vault = new MemoryVault();
+  await vault.createFolder(".mdbase");
+  await vault.create(".mdbase/connect-role.json", `${JSON.stringify({
+    version: 1,
+    role: "mirror",
+    collection_id: session.collection_id,
+  })}\n`);
+  const state = new MemoryMirrorStateStore();
+  const profile: import("../src/connectSync").MirrorProfile = {
+    version: 1,
+    syncUrl: `https://sync.example/v1/authorities/${session.collection_id}/sync`,
+    controlUrl: "https://connect.example",
+    collectionId: session.collection_id,
+    replicaId,
+    mode: "read_write",
+    name: "Review ledger",
+    enrollmentId: "11111111-1111-4111-8111-111111111111",
+    accessTokenExpiresAt: "2099-01-01T00:00:00.000Z",
+  };
+  const controller = new ConnectSyncController({
+    vault,
+    secretStorage: {
+      setSecret: () => undefined,
+      getSecret: () => "access-token",
+      listSecrets: () => [],
+    },
+  } as never, {
+    getMirrorProfile: () => profile,
+    saveMirrorProfile: async () => undefined,
+  }, {
+    stateStoreFactory: () => state,
+    blobStoreFactory: () => new MemoryMirrorBlobStore(),
+    fileSystem: new ObsidianMirrorFileSystem(vault as never),
+    transportFactory: () => hosted.transport(replicaId),
+  });
+
+  const first = await controller.preview();
+  assert.equal(first.phase, "initial");
+  assert.deepEqual(first.entries.map((entry) => [entry.direction, entry.action, entry.path]), [
+    ["download", "create", "notes/one.md"],
+  ]);
+  await controller.sync();
+  const local = vault.getAbstractFileByPath("notes/one.md") as TFile;
+  await vault.modify(local, (vault.read(local.path) ?? "").replace("First", "Edited locally"));
+  const incremental = await controller.preview();
+  assert.equal(incremental.phase, "incremental");
+  assert.deepEqual(incremental.entries.map((entry) => [entry.direction, entry.action, entry.path]), [
+    ["upload", "update", "notes/one.md"],
+  ]);
 });
 
 test("writable mirror uploads local edits and collision preflight makes no writes", async () => {

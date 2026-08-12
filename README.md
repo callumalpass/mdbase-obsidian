@@ -32,13 +32,28 @@ files.
 ### Hosted mirror
 
 `Connect a hosted collection` enrolls the vault through mdbase Connect. The
-portable directory-mirror engine syncs hosted resources and records into the
-vault. A mirror role marker is stored below `.mdbase/`; credentials are stored
-only in Obsidian SecretStorage.
+portable directory-mirror engine syncs hosted resources, records, and opt-in
+collection files into the vault. A mirror role marker is stored below
+`.mdbase/`; credentials are stored only in Obsidian SecretStorage.
 
 The plugin refuses to enroll a directory that contains local collection
 authority metadata. Sync is explicit, preflighted, protected by an in-process
 lease, and conservative around conflicts.
+
+Before every sync, the workspace presents an exact transfer ledger grouped by
+downloads, uploads, and items needing attention. If the hosted head or local
+changes move after review, the plugin stops and asks for a fresh review. Sync
+can be stopped safely after the current request without losing its durable
+checkpoint, and path collisions never overwrite local files silently.
+
+Markdown always syncs. Binary files are an explicit per-device choice, grouped
+as images, audio, video, PDFs, and other files, with collection-relative folder
+exclusions. Hidden, reserved, Markdown, and non-portable file paths are never
+materialized. Downloads and uploads are digest-verified; writable uploads are
+staged in a chunked, content-addressed IndexedDB cache so an interrupted sync
+can resume safely. Binary creates, updates, moves, deletes, and conflicts appear
+as files—not Markdown—in the preflight ledger. Local collection adoption uses
+the same policy and stages exact bytes for both warm and fenced snapshots.
 
 ## Type workbench
 
@@ -46,8 +61,13 @@ Open **mdbase: Open workspace** and choose **Types**.
 
 - Design mode edits identity, membership, placement, and recursive field
   schemas—including nested objects, lists, lists of objects, enums, and links.
+- The application compatibility section discovers local record contracts under
+  `_contracts/`, lets you map contract fields to type fields, and edits binding
+  settings from their JSON Schema.
 - YAML mode exposes the canonical type definition.
 - Unknown v0.3 schema and extension data is preserved by guided edits.
+- Drafts survive plugin reloads and Obsidian restarts; stale source revisions
+  are blocked, and high-impact schema changes require an explicit review.
 - Dirty changes and validation failures are shown before save.
 - v0.2 definitions are browsable but read-only until migration.
 
@@ -118,9 +138,10 @@ npm run build:test
 enforces checked-in schema, migration-analysis, validation, and issue-render
 budgets.
 
-The Connect SDK and mdbase interop packages are installed from npm at exact
-prerelease versions. Update `package.json` and regenerate `package-lock.json`
-when advancing them.
+The Connect protocol and sync SDKs are pinned to `0.1.0-beta.31`, and mdbase
+interop is pinned to `0.1.0-rc.2`. Update `package.json`, regenerate
+`package-lock.json`, and rerun the binary round-trip and mobile gates when
+advancing them.
 
 ## Compatibility
 

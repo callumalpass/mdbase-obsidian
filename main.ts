@@ -1,7 +1,6 @@
 import {
   App,
   addIcon,
-  ItemView,
   MarkdownView,
   Modal,
   Notice,
@@ -10,7 +9,6 @@ import {
   Setting,
   SuggestModal,
   TFile,
-  WorkspaceLeaf,
   normalizePath,
 } from "obsidian";
 import {
@@ -29,15 +27,18 @@ import {
   formatMarkdown,
   getPromptFields,
   getTopLevelFieldFromIssuePath,
+  getTypesForFile,
   loadMdbaseConfig,
+  loadContractDefinitions,
   loadTypeDefinitions,
   parseFrontmatter,
   validateCollection,
   validateFile,
 } from "./src/mdbaseCore";
-import type { TypeEditorModel } from "./src/typeEditorTypes";
+import type { StoredTypeDraft, TypeEditorModel } from "./src/typeEditorTypes";
 import {
   ConnectSyncController,
+  normalizeSelectiveSync,
   type MirrorProfile,
 } from "./src/connectSync";
 import {
@@ -49,6 +50,7 @@ import {
   frontmatterFromTypeModel,
   typeModelFromDocument,
 } from "./src/typeModel";
+import { sourceRevision } from "./src/typeDraft";
 import {
   MDBASE_WORKSPACE_VIEW,
   MdbaseWorkspaceView,
@@ -56,14 +58,13 @@ import {
 } from "./src/workspaceView";
 import { MDBASE_ICON_ID, MDBASE_ICON_SVG } from "./src/mdbaseIcon";
 
-const MDBASE_ISSUES_VIEW = "mdbase-issues-view";
-
 interface MdbasePluginSettings {
   validateOnSave: boolean;
   validateOnOpen: boolean;
   showNoticeOnSave: boolean;
   interopEnabled: boolean;
   mirrorProfile: MirrorProfile | null;
+  typeDrafts: Record<string, StoredTypeDraft>;
 }
 
 const DEFAULT_SETTINGS: MdbasePluginSettings = {
@@ -72,6 +73,7 @@ const DEFAULT_SETTINGS: MdbasePluginSettings = {
   showNoticeOnSave: false,
   interopEnabled: false,
   mirrorProfile: null,
+  typeDrafts: {},
 };
 
 function isMirrorProfile(value: unknown): value is MirrorProfile {
@@ -85,7 +87,11 @@ function isMirrorProfile(value: unknown): value is MirrorProfile {
     && (profile.mode === "read_only" || profile.mode === "read_write")
     && typeof profile.name === "string"
     && typeof profile.enrollmentId === "string"
-    && typeof profile.accessTokenExpiresAt === "string";
+    && typeof profile.accessTokenExpiresAt === "string"
+    && (profile.selectiveSync === undefined || (
+      Array.isArray(profile.selectiveSync.file_classes)
+      && Array.isArray(profile.selectiveSync.excluded_folders)
+    ));
 }
 
 function escapeRegExp(value: string): string {
@@ -259,152 +265,6 @@ function pickType(app: App, typeDefs: MdbaseTypeDef[]): Promise<MdbaseTypeDef | 
   });
 }
 
-class MdbaseIssuesView extends ItemView {
-  plugin: MdbasePlugin;
-  private severityFilter: "all" | "error" | "warn" = "all";
-  private query = "";
-
-  constructor(leaf: WorkspaceLeaf, plugin: MdbasePlugin) {
-    super(leaf);
-    this.plugin = plugin;
-  }
-
-  getViewType(): string {
-    return MDBASE_ISSUES_VIEW;
-  }
-
-  getDisplayText(): string {
-    return "mdbase issues";
-  }
-
-  getIcon(): string {
-    return "shield-alert";
-  }
-
-  async onOpen(): Promise<void> {
-    this.containerEl.empty();
-    this.containerEl.addClass("mdbase-issues-view");
-    this.render();
-  }
-
-  render(): void {
-    const container = this.containerEl;
-    container.empty();
-    container.addClass("mdbase-issues-view");
-
-    const header = container.createDiv({ cls: "mdbase-issues-header" });
-    header.createEl("h3", { text: "mdbase Issues" });
-
-    const headerActions = header.createDiv({ cls: "mdbase-issues-header-actions" });
-    const refreshButton = headerActions.createEl("button", { text: "Refresh" });
-    refreshButton.addClass("mod-cta");
-    refreshButton.onclick = () => {
-      void this.plugin.runCollectionValidation(false);
-    };
-
-    const controls = container.createDiv({ cls: "mdbase-issues-controls" });
-
-    const severitySelect = controls.createEl("select");
-    severitySelect.addClass("mdbase-issues-severity");
-    severitySelect.createEl("option", { value: "all", text: "All severities" });
-    severitySelect.createEl("option", { value: "error", text: "Errors only" });
-    severitySelect.createEl("option", { value: "warn", text: "Warnings only" });
-    severitySelect.value = this.severityFilter;
-    severitySelect.onchange = () => {
-      const next = severitySelect.value;
-      if (next === "error" || next === "warn" || next === "all") {
-        this.severityFilter = next;
-      }
-      this.render();
-    };
-
-    const queryInput = controls.createEl("input", { type: "search" });
-    queryInput.addClass("mdbase-issues-query");
-    queryInput.placeholder = "Filter by path, code, message, field";
-    queryInput.value = this.query;
-    queryInput.oninput = () => {
-      this.query = queryInput.value;
-      this.render();
-    };
-
-    const issues = this.plugin.getIssues();
-    const normalizedQuery = this.query.trim().toLowerCase();
-    const filtered = issues.filter((issue) => {
-      if (this.severityFilter !== "all" && issue.severity !== this.severityFilter) return false;
-      if (!normalizedQuery) return true;
-
-      const haystack = `${issue.path} ${issue.code} ${issue.message} ${issue.field ?? ""}`.toLowerCase();
-      return haystack.includes(normalizedQuery);
-    });
-
-    const visible = filtered.slice(0, 500);
-    container.createDiv({
-      cls: "mdbase-issues-count",
-      text:
-        filtered.length > visible.length
-          ? `Showing ${visible.length} of ${filtered.length} matching issues`
-          : filtered.length === issues.length
-          ? `${filtered.length} issue${filtered.length === 1 ? "" : "s"}`
-          : `${filtered.length} of ${issues.length} issue${issues.length === 1 ? "" : "s"}`,
-    });
-
-    if (filtered.length === 0) {
-      container.createDiv({
-        cls: "mdbase-empty",
-        text: issues.length === 0 ? "No validation issues." : "No issues match current filters.",
-      });
-      return;
-    }
-
-    const grouped = new Map<string, MdbaseIssue[]>();
-    for (const issue of visible) {
-      const current = grouped.get(issue.path) ?? [];
-      current.push(issue);
-      grouped.set(issue.path, current);
-    }
-
-    for (const [path, fileIssues] of grouped.entries()) {
-      container.createDiv({ cls: "mdbase-issue-file", text: path });
-
-      for (const issue of fileIssues) {
-        const item = container.createDiv({ cls: "mdbase-issue-item" });
-        item.setAttr("data-severity", issue.severity);
-
-        item.createDiv({
-          cls: "mdbase-issue-code",
-          text: `${issue.severity.toUpperCase()} · ${issue.code}${issue.field ? ` · ${issue.field}` : ""}`,
-        });
-        item.createDiv({
-          cls: "mdbase-issue-message",
-          text: issue.message,
-        });
-
-        const actions = item.createDiv({ cls: "mdbase-issue-actions" });
-        const openButton = actions.createEl("button", {
-          text: issue.field ? "Open field" : "Open file",
-        });
-        openButton.onclick = (event) => {
-          event.stopPropagation();
-          void this.plugin.openIssue(issue);
-        };
-
-        const quickFixLabel = this.plugin.getQuickFixLabel(issue);
-        if (quickFixLabel) {
-          const quickFixButton = actions.createEl("button", { text: quickFixLabel });
-          quickFixButton.onclick = (event) => {
-            event.stopPropagation();
-            void this.plugin.applyQuickFix(issue);
-          };
-        }
-
-        item.onclick = () => {
-          void this.plugin.openIssue(issue);
-        };
-      }
-    }
-  }
-}
-
 class MdbaseSettingTab extends PluginSettingTab {
   plugin: MdbasePlugin;
 
@@ -466,6 +326,7 @@ class MdbaseSettingTab extends PluginSettingTab {
 interface LoadedSchema {
   config: MdbaseConfig;
   types: Map<string, MdbaseTypeDef>;
+  contracts: Awaited<ReturnType<typeof loadContractDefinitions>>;
 }
 
 export interface MdbaseObsidianApiV1 {
@@ -516,76 +377,85 @@ export default class MdbasePlugin extends Plugin {
     addIcon(MDBASE_ICON_ID, MDBASE_ICON_SVG);
 
     this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass("mdbase-status-bar");
+    this.statusBarEl.setAttr("role", "button");
+    this.statusBarEl.setAttr("tabindex", "0");
+    this.statusBarEl.setAttr("aria-label", "Open mdbase issues");
+    this.registerDomEvent(this.statusBarEl, "click", () => void this.openWorkspace("issues"));
+    this.registerDomEvent(this.statusBarEl, "keydown", (event: KeyboardEvent) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      void this.openWorkspace("issues");
+    });
     this.updateStatusBar();
 
     this.registerView(MDBASE_WORKSPACE_VIEW, (leaf) => new MdbaseWorkspaceView(leaf, this));
-    this.registerView(MDBASE_ISSUES_VIEW, (leaf) => new MdbaseIssuesView(leaf, this));
     this.addSettingTab(new MdbaseSettingTab(this.app, this));
     this.addRibbonIcon(MDBASE_ICON_ID, "Open mdbase", () => void this.openWorkspace());
 
     this.addCommand({
       id: "mdbase-open",
-      name: "mdbase: Open workspace",
+      name: "Open workspace",
       callback: () => void this.openWorkspace(),
     });
 
     this.addCommand({
       id: "mdbase-initialize-collection",
-      name: "mdbase: Initialize collection",
+      name: "Initialize collection",
       callback: () => void this.initializeCollectionCommand(),
     });
 
     this.addCommand({
       id: "mdbase-create-type",
-      name: "mdbase: Create type definition",
-      callback: () => void this.openWorkspace("types"),
+      name: "Create type definition",
+      callback: () => void this.createTypeDefinitionCommand(),
     });
 
     this.addCommand({
       id: "mdbase-edit-type",
-      name: "mdbase: Edit type definition",
-      callback: () => void this.openWorkspace("types"),
+      name: "Edit type definition",
+      callback: () => void this.editTypeDefinitionCommand(),
     });
 
     this.addCommand({
       id: "mdbase-edit-current-type",
-      name: "mdbase: Edit current type definition",
-      callback: () => void this.openWorkspace("types"),
+      name: "Edit current type definition",
+      callback: () => void this.editCurrentTypeDefinitionCommand(),
     });
 
     this.addCommand({
       id: "mdbase-create-note-from-type",
-      name: "mdbase: Create note from type",
+      name: "Create note from type",
       callback: () => void this.createNoteFromTypeCommand(),
     });
 
     this.addCommand({
       id: "mdbase-validate-current-note",
-      name: "mdbase: Validate current note",
+      name: "Validate current note",
       callback: () => void this.validateCurrentNoteCommand(),
     });
 
     this.addCommand({
       id: "mdbase-validate-collection",
-      name: "mdbase: Validate collection",
+      name: "Validate collection",
       callback: () => void this.runCollectionValidation(true),
     });
 
     this.addCommand({
       id: "mdbase-open-issues-view",
-      name: "mdbase: Open issues view",
+      name: "Open issues view",
       callback: () => void this.openWorkspace("issues"),
     });
 
     this.addCommand({
       id: "mdbase-sync",
-      name: "mdbase: Sync collection authority",
+      name: "Sync collection authority",
       callback: () => void this.syncHostedCollectionCommand(),
     });
 
     this.addCommand({
       id: "mdbase-open-sync",
-      name: "mdbase: Open sync",
+      name: "Open sync",
       callback: () => void this.openWorkspace("sync"),
     });
 
@@ -634,7 +504,6 @@ export default class MdbasePlugin extends Plugin {
   async onunload(): Promise<void> {
     await this.interopBridge.dispose();
     this.app.workspace.getLeavesOfType(MDBASE_WORKSPACE_VIEW).forEach((leaf) => leaf.detach());
-    this.app.workspace.getLeavesOfType(MDBASE_ISSUES_VIEW).forEach((leaf) => leaf.detach());
     this.clearAllPendingSaveValidations();
   }
 
@@ -642,6 +511,16 @@ export default class MdbasePlugin extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     if (!isMirrorProfile(this.settings.mirrorProfile)) {
       this.settings.mirrorProfile = null;
+    } else {
+      try {
+        this.settings.mirrorProfile.selectiveSync = normalizeSelectiveSync(this.settings.mirrorProfile.selectiveSync);
+      } catch {
+        // Fail closed for corrupted legacy data without discarding enrollment.
+        this.settings.mirrorProfile.selectiveSync = normalizeSelectiveSync();
+      }
+    }
+    if (!this.settings.typeDrafts || typeof this.settings.typeDrafts !== "object" || Array.isArray(this.settings.typeDrafts)) {
+      this.settings.typeDrafts = {};
     }
   }
 
@@ -657,7 +536,9 @@ export default class MdbasePlugin extends Plugin {
   }
 
   getMirrorProfile(): MirrorProfile | null {
-    return this.settings.mirrorProfile ? { ...this.settings.mirrorProfile } : null;
+    return this.settings.mirrorProfile
+      ? JSON.parse(JSON.stringify(this.settings.mirrorProfile)) as MirrorProfile
+      : null;
   }
 
   async loadWorkspaceSchema(forceReload = false): Promise<MdbaseWorkspaceSchema | null> {
@@ -667,14 +548,38 @@ export default class MdbasePlugin extends Plugin {
   async loadTypeModel(path: string): Promise<TypeEditorModel> {
     const file = this.app.vault.getAbstractFileByPath(normalizePath(path));
     if (!(file instanceof TFile)) throw new Error(`Type file not found: ${path}`);
-    const parsed = parseFrontmatter(await this.app.vault.cachedRead(file));
+    const source = await this.app.vault.cachedRead(file);
+    const parsed = parseFrontmatter(source);
     if (!parsed.hasFrontmatter || parsed.error) {
       throw new Error(`Invalid type frontmatter: ${parsed.error ?? "frontmatter is missing"}`);
     }
-    return typeModelFromDocument(parsed.frontmatter, parsed.body, file.basename);
+    const model = typeModelFromDocument(parsed.frontmatter, parsed.body, file.basename);
+    model.sourceRevision = sourceRevision(source);
+    return model;
   }
 
-  async saveTypeModel(model: TypeEditorModel, existingPath: string | null): Promise<TFile> {
+  loadTypeDraft(path: string | null): StoredTypeDraft | null {
+    const draft = this.settings.typeDrafts[path ?? "__new__"];
+    return draft ? JSON.parse(JSON.stringify(draft)) as StoredTypeDraft : null;
+  }
+
+  async saveTypeDraft(draft: StoredTypeDraft): Promise<void> {
+    this.settings.typeDrafts[draft.path ?? "__new__"] = JSON.parse(JSON.stringify(draft)) as StoredTypeDraft;
+    await this.saveSettings();
+  }
+
+  async clearTypeDraft(path: string | null): Promise<void> {
+    const key = path ?? "__new__";
+    if (!(key in this.settings.typeDrafts)) return;
+    delete this.settings.typeDrafts[key];
+    await this.saveSettings();
+  }
+
+  async saveTypeModel(
+    model: TypeEditorModel,
+    existingPath: string | null,
+    expectedSourceRevision?: string,
+  ): Promise<TFile> {
     this.connectSync.assertLocalAuthorityWritable();
     if (this.getMirrorProfile()?.mode === "read_only") {
       throw new Error("This mirror has read-only access. Re-enroll it with write access before editing types.");
@@ -690,7 +595,12 @@ export default class MdbasePlugin extends Plugin {
     if (existing != null && !(existing instanceof TFile)) {
       throw new Error(`Type file not found: ${existingPath}`);
     }
-    const saved = await this.writeTypeDefinition(config, model, existing as TFile | null);
+    const saved = await this.writeTypeDefinition(
+      config,
+      model,
+      existing as TFile | null,
+      expectedSourceRevision,
+    );
     this.refreshWorkspaceViews(true);
     return saved;
   }
@@ -841,36 +751,25 @@ export default class MdbasePlugin extends Plugin {
   }
 
   private async openIssuesView(): Promise<void> {
-    const existing = this.app.workspace.getLeavesOfType(MDBASE_ISSUES_VIEW)[0];
-    if (existing) {
-      this.app.workspace.revealLeaf(existing);
-      (existing.view as MdbaseIssuesView).render();
-      return;
-    }
-
-    const leaf = this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
-    await leaf.setViewState({
-      type: MDBASE_ISSUES_VIEW,
-      active: true,
-    });
-
-    this.app.workspace.revealLeaf(leaf);
+    await this.openWorkspace("issues");
   }
 
-  async openWorkspace(destination: "types" | "sync" | "issues" = "types"): Promise<void> {
+  async openWorkspace(destination: "types" | "sync" | "issues" = "types"): Promise<MdbaseWorkspaceView> {
     const existing = this.app.workspace.getLeavesOfType(MDBASE_WORKSPACE_VIEW)[0];
     if (existing) {
       this.app.workspace.revealLeaf(existing);
       const view = existing.view as MdbaseWorkspaceView;
       view.showDestination(destination);
       await view.refresh();
-      return;
+      return view;
     }
     const leaf = this.app.workspace.getLeaf(true);
     await leaf.setViewState({ type: MDBASE_WORKSPACE_VIEW, active: true });
     this.app.workspace.revealLeaf(leaf);
     const view = leaf.view as MdbaseWorkspaceView;
+    await view.refresh();
     view.showDestination(destination);
+    return view;
   }
 
   private refreshWorkspaceViews(forceReload = false): void {
@@ -881,9 +780,6 @@ export default class MdbasePlugin extends Plugin {
 
   private refreshIssueViews(): void {
     this.updateStatusBar();
-    for (const leaf of this.app.workspace.getLeavesOfType(MDBASE_ISSUES_VIEW)) {
-      (leaf.view as MdbaseIssuesView).render();
-    }
     this.refreshWorkspaceViews();
   }
 
@@ -950,9 +846,10 @@ export default class MdbasePlugin extends Plugin {
     const normalized = normalizePath(path);
     if (normalized === "mdbase.yaml") return true;
 
-    const possibleFolders = new Set<string>(["_types"]);
+    const possibleFolders = new Set<string>(["_types", "_contracts"]);
     if (this.schemaCache) {
       possibleFolders.add(normalizePath(this.schemaCache.config.settings.types_folder));
+      possibleFolders.add(normalizePath(this.schemaCache.config.settings.contracts_folder ?? "_contracts"));
     }
 
     for (const folder of possibleFolders) {
@@ -979,7 +876,8 @@ export default class MdbasePlugin extends Plugin {
       const config = await loadMdbaseConfig(this.app.vault);
       if (!config) return null;
       const types = await loadTypeDefinitions(this.app.vault, config);
-      return { config, types };
+      const contracts = await loadContractDefinitions(this.app.vault, config);
+      return { config, types, contracts };
     })();
 
     try {
@@ -1094,20 +992,60 @@ export default class MdbasePlugin extends Plugin {
       await this.openWorkspace("sync");
       return;
     }
-    try {
-      const status = await this.connectSync.sync();
-      this.invalidateSchemaCache();
-      this.refreshWorkspaceViews(true);
-      const attentionCount = status.conflicts.length + status.local_issues.length;
-      new Notice(
-        attentionCount
-          ? `Sync completed with ${attentionCount} item${attentionCount === 1 ? "" : "s"} needing attention.`
-          : "mdbase sync completed.",
-      );
-    } catch (error) {
-      new Notice(`mdbase sync failed: ${error instanceof Error ? error.message : String(error)}`);
-      await this.openWorkspace("sync");
+    await this.openWorkspace("sync");
+    new Notice("Review the exact transfer plan before synchronizing.");
+  }
+
+  private async createTypeDefinitionCommand(): Promise<void> {
+    const view = await this.openWorkspace("types");
+    view.createNewType();
+  }
+
+  private async editTypeDefinitionCommand(): Promise<void> {
+    const loaded = await this.requireConfigAndTypes();
+    if (!loaded || loaded.types.size === 0) {
+      new Notice("No type definitions found.");
+      return;
     }
+    const chosen = await pickType(this.app, [...loaded.types.values()]);
+    if (!chosen) return;
+    const view = await this.openWorkspace("types");
+    await view.editType(chosen.filePath);
+  }
+
+  private async editCurrentTypeDefinitionCommand(): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (!(file instanceof TFile) || file.extension !== "md") {
+      new Notice("Open a typed Markdown note or type definition first.");
+      return;
+    }
+    const loaded = await this.requireConfigAndTypes();
+    if (!loaded) return;
+    const definition = [...loaded.types.values()].find((type) => type.filePath === file.path);
+    let chosen = definition ?? null;
+    if (!chosen) {
+      const parsed = parseFrontmatter(await this.app.vault.cachedRead(file));
+      if (parsed.error) {
+        new Notice(`Cannot identify this note's type: ${parsed.error}`);
+        return;
+      }
+      const names = getTypesForFile(file.path, parsed.frontmatter, loaded.config, loaded.types);
+      const candidates = names.flatMap((name) => {
+        const type = loaded.types.get(name);
+        return type ? [type] : [];
+      });
+      if (candidates.length === 0) {
+        new Notice("The current note does not match a known type definition.");
+        return;
+      }
+      chosen = candidates.length === 1 ? candidates[0] : await pickType(this.app, candidates);
+    }
+    if (!chosen) {
+      new Notice("The current note does not match a known type definition.");
+      return;
+    }
+    const view = await this.openWorkspace("types");
+    await view.editType(chosen.filePath);
   }
 
   private async createNoteFromTypeCommand(): Promise<void> {
@@ -1242,6 +1180,7 @@ export default class MdbasePlugin extends Plugin {
     config: MdbaseConfig,
     model: TypeEditorModel,
     existingFile: TFile | null,
+    expectedSourceRevision?: string,
   ): Promise<TFile> {
     const typeName = model.name.trim();
     if (!typeName) {
@@ -1270,6 +1209,13 @@ export default class MdbasePlugin extends Plugin {
       return created;
     }
 
+    const originalPath = existingFile.path;
+    const originalContent = await this.app.vault.cachedRead(existingFile);
+    if (expectedSourceRevision && sourceRevision(originalContent) !== expectedSourceRevision) {
+      throw new Error(
+        `The source changed after this draft was opened: ${originalPath}. Reopen the type and review both versions before saving.`,
+      );
+    }
     const slashIndex = existingFile.path.lastIndexOf("/");
     const parentFolder = slashIndex >= 0 ? existingFile.path.slice(0, slashIndex) : "";
     const renamedPath = normalizePath(`${parentFolder ? `${parentFolder}/` : ""}${typeName}.md`);
@@ -1279,17 +1225,35 @@ export default class MdbasePlugin extends Plugin {
       throw new Error(`Cannot rename type file to ${targetPath}; file already exists.`);
     }
 
-    if (targetPath !== existingFile.path) {
-      await this.app.fileManager.renameFile(existingFile, targetPath);
-    }
+    let renamed = false;
+    try {
+      if (targetPath !== existingFile.path) {
+        await this.app.fileManager.renameFile(existingFile, targetPath);
+        renamed = true;
+      }
 
-    const updatedFile = this.app.vault.getAbstractFileByPath(targetPath);
-    if (!(updatedFile instanceof TFile)) {
-      throw new Error(`Unable to access updated type file: ${targetPath}`);
-    }
+      const updatedFile = this.app.vault.getAbstractFileByPath(targetPath);
+      if (!(updatedFile instanceof TFile)) {
+        throw new Error(`Unable to access updated type file: ${targetPath}`);
+      }
 
-    await this.app.vault.modify(updatedFile, content);
-    this.invalidateSchemaCache();
-    return updatedFile;
+      await this.app.vault.modify(updatedFile, content);
+      this.invalidateSchemaCache();
+      return updatedFile;
+    } catch (error) {
+      try {
+        const current = this.app.vault.getAbstractFileByPath(renamed ? targetPath : originalPath);
+        if (current instanceof TFile) {
+          await this.app.vault.modify(current, originalContent);
+          if (renamed) await this.app.fileManager.renameFile(current, originalPath);
+        }
+      } catch (rollbackError) {
+        throw new Error(
+          `Saving the type failed and automatic recovery also failed. Review '${originalPath}' and '${targetPath}'. `
+          + `${error instanceof Error ? error.message : String(error)}; recovery: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+      throw error;
+    }
   }
 }

@@ -11,8 +11,21 @@ import {
 import picomatch from "picomatch";
 import type {
   AuthorityImportSnapshot,
+  CollectionFileDescriptor,
+  CommitFileUploadReceipt,
+  DeleteFileReceipt,
+  DeleteFileRequest,
+  FileMediaClass,
+  FileTransferSession,
   JsonObject,
+  MoveFileReceipt,
+  MoveFileRequest,
+  OpenFileUploadRequest,
+  PreparedFilePart,
+  SelectiveSyncPolicy,
+  SyncChange,
   SyncChangesPage,
+  SyncFileSnapshotPage,
   SyncMutation,
   SyncMutationReceipt,
   SyncSession,
@@ -27,6 +40,7 @@ import {
   AuthorityAdoptionError,
   AuthorityAdoptionOutcomeUnknownError,
   buildPortableAuthoritySnapshot,
+  portableRecordId,
   type AuthorityAdoptionRequester,
   type AuthorityAdoptionSession,
   type AuthorityAdoptionStatus,
@@ -35,9 +49,11 @@ import {
 } from "@mdbase-dev/connect-sync/adoption";
 import {
   DirectoryMirror,
+  portableMirrorRuntime,
   type DirectoryMirrorOptions,
+  type MirrorBinaryInfo,
+  type MirrorBlobStore,
   type MirrorFileSystem,
-  type MirrorInitializationPreview,
   type MirrorLease,
   type MirrorProgress,
   type MirrorState,
@@ -58,6 +74,16 @@ import {
   loadMdbaseConfig,
   normalizeSafeRelativePath,
 } from "./mdbaseCore";
+import {
+  type MdbaseSyncPreview,
+  type SyncPreviewEntry,
+  flagConcurrentFileChanges,
+  localChangeEntries,
+  localFileChangeEntries,
+  remoteChangeEntries,
+  remoteFileChangeEntries,
+  summarizePreview,
+} from "./syncPreview";
 
 export interface MirrorProfile {
   version: 1;
@@ -69,6 +95,7 @@ export interface MirrorProfile {
   name: string;
   enrollmentId: string;
   accessTokenExpiresAt: string;
+  selectiveSync?: SelectiveSyncPolicy;
 }
 
 export interface EnrollMirrorInput {
@@ -76,6 +103,7 @@ export interface EnrollMirrorInput {
   mirrorName: string;
   mode: MirrorEnrollmentMode;
   collectionId?: string;
+  selectiveSync?: SelectiveSyncPolicy;
 }
 
 export interface EnrollMirrorCallbacks {
@@ -87,6 +115,7 @@ export interface EnrollMirrorCallbacks {
 export interface AdoptLocalCollectionInput {
   controlUrl: string;
   mirrorName: string;
+  selectiveSync?: SelectiveSyncPolicy;
 }
 
 export interface AdoptLocalCollectionCallbacks {
@@ -94,6 +123,7 @@ export interface AdoptLocalCollectionCallbacks {
     verification: AuthorityAdoptionVerification | MirrorEnrollmentVerification,
   ): void | Promise<void>;
   onStatus?(status: AuthorityAdoptionStatus): void;
+  onFileProgress?(path: string, transferredBytes: number, totalBytes: number): void;
   signal?: AbortSignal;
 }
 
@@ -107,11 +137,17 @@ const ADOPTION_MARKER_PATH = ".mdbase/authority-adoption.json";
 const ADOPTION_SNAPSHOT_PATH = ".mdbase/authority-adoption-snapshot.json";
 const STATE_DATABASE = "mdbase-obsidian-connect";
 const STATE_STORE = "mirrors";
+const BLOB_DATABASE = "mdbase-obsidian-connect-blobs";
+const BLOB_MANIFEST_STORE = "manifests";
+const BLOB_CHUNK_STORE = "chunks";
+const BLOB_CHUNK_BYTES = 1024 * 1024;
 const ACCESS_SECRET_PREFIX = "mdbase-connect-access-";
 const REFRESH_SECRET_PREFIX = "mdbase-connect-refresh-";
 const ADOPTION_SECRET_PREFIX = "mdbase-connect-adoption-";
 const TOKEN_RENEWAL_WINDOW_MS = 5 * 60 * 1_000;
 const RESERVED_WRITE_PREFIXES = [".git/", ".obsidian/", ".trash/", ".mdbase/"];
+const RESERVED_BINARY_COMPONENTS = new Set([".git", ".mdbase", ".obsidian", ".trash", "node_modules", "_contracts", "_schemas", "_types", "_views"]);
+const FILE_CLASS_ORDER: FileMediaClass[] = ["image", "audio", "video", "pdf", "other"];
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface MirrorMarker {
@@ -124,6 +160,7 @@ interface AdoptionMarker {
   version: 1;
   phase: "waiting_for_approval" | "uploading" | "fenced" | "activating" | "adopted";
   session: Omit<AuthorityAdoptionSession, "credential">;
+  selective_sync?: SelectiveSyncPolicy;
   manifest_digest: string | null;
   source_revision: string | null;
   source_head: number | null;
@@ -131,6 +168,112 @@ interface AdoptionMarker {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function normalizeSelectiveSync(input?: Partial<SelectiveSyncPolicy> | null): SelectiveSyncPolicy {
+  const rawClasses = input?.file_classes ?? [];
+  if (rawClasses.some((value) => !FILE_CLASS_ORDER.includes(value as FileMediaClass)) || new Set(rawClasses).size !== rawClasses.length) {
+    throw new SyncError("invalid_file_materialization", "Selected file media classes must be valid and unique.");
+  }
+  const classes = [...rawClasses].sort((left, right) => FILE_CLASS_ORDER.indexOf(left) - FILE_CLASS_ORDER.indexOf(right));
+  const rawFolders = input?.excluded_folders ?? [];
+  if (rawFolders.some((value) => typeof value !== "string" || !value.trim())) {
+    throw new SyncError("invalid_file_materialization", "Excluded folders cannot be empty.");
+  }
+  const folders = rawFolders
+    .map((value) => normalizeSafeRelativePath(value.trim()))
+    .sort((left, right) => left.toLocaleLowerCase().localeCompare(right.toLocaleLowerCase()));
+  if (folders.length > 100) throw new SyncError("invalid_file_materialization", "File sync supports at most 100 excluded folders.");
+  if (new Set(folders.map((folder) => folder.toLocaleLowerCase())).size !== folders.length) {
+    throw new SyncError("invalid_file_materialization", "Excluded folders must be unique on portable filesystems.");
+  }
+  for (const folder of folders) assertVisibleBinaryPath(folder, true);
+  return { file_classes: classes, excluded_folders: folders };
+}
+
+function classifyBinaryPath(path: string): FileMediaClass {
+  const extension = path.includes(".") ? path.slice(path.lastIndexOf(".") + 1).toLowerCase() : "";
+  if (["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"].includes(extension)) return "image";
+  if (["flac", "m4a", "mp3", "oga", "ogg", "opus", "wav"].includes(extension)) return "audio";
+  if (["3gp", "mkv", "mov", "mp4", "webm"].includes(extension)) return "video";
+  return extension === "pdf" ? "pdf" : "other";
+}
+
+function binaryPathSelected(policy: SelectiveSyncPolicy, path: string, mediaClass = classifyBinaryPath(path)): boolean {
+  if (!policy.file_classes.includes(mediaClass)) return false;
+  const normalized = normalizePath(path);
+  return !policy.excluded_folders.some((folder) => normalized === folder || normalized.startsWith(`${folder}/`));
+}
+
+function assertVisibleBinaryPath(input: string, folder = false): string {
+  const path = normalizeSafeRelativePath(input);
+  const components = path.split("/");
+  if (
+    path.length > 1024
+    || (!folder && /\.md$/i.test(path))
+    || components.some((component) => component.startsWith(".")
+      || RESERVED_BINARY_COMPONENTS.has(component.toLowerCase())
+      || /[<>"|?*]/u.test(component)
+      || /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/iu.test(component))
+  ) {
+    throw new SyncError("invalid_file_path", `Collection file path ${path} is hidden, reserved, or non-portable.`);
+  }
+  return path;
+}
+
+async function binaryInfo(bytes: ArrayBuffer): Promise<MirrorBinaryInfo> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return {
+    size: bytes.byteLength,
+    content_digest: `sha256:${Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")}`,
+  };
+}
+
+async function collectBinary(source: AsyncIterable<Uint8Array>): Promise<ArrayBuffer> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for await (const chunk of source) {
+    if (!(chunk instanceof Uint8Array)) throw new SyncError("file_integrity_failed", "A binary stream returned an invalid chunk.");
+    if (!chunk.byteLength) continue;
+    size += chunk.byteLength;
+    if (!Number.isSafeInteger(size)) throw new SyncError("file_too_large", "The binary file is too large for this device.");
+    chunks.push(Uint8Array.from(chunk));
+  }
+  const output = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output.buffer;
+}
+
+function mediaTypeForPath(path: string): string | undefined {
+  const extension = path.includes(".") ? path.slice(path.lastIndexOf(".") + 1).toLowerCase() : "";
+  return ({
+    avif: "image/avif", gif: "image/gif", jpeg: "image/jpeg", jpg: "image/jpeg", png: "image/png",
+    svg: "image/svg+xml", webp: "image/webp", flac: "audio/flac", m4a: "audio/mp4", mp3: "audio/mpeg",
+    ogg: "audio/ogg", opus: "audio/opus", wav: "audio/wav", mov: "video/quicktime", mp4: "video/mp4",
+    webm: "video/webm", pdf: "application/pdf",
+  } as Record<string, string>)[extension];
+}
+
+function formatByteCount(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+async function adoptionRequestBody(value: unknown, raw: boolean | undefined): Promise<string | ArrayBuffer | undefined> {
+  if (value === undefined) return undefined;
+  if (!raw) return JSON.stringify(value);
+  if (value instanceof ArrayBuffer) return value;
+  if (ArrayBuffer.isView(value)) {
+    return Uint8Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)).buffer;
+  }
+  if (value instanceof Blob) return value.arrayBuffer();
+  throw new SyncError("invalid_file_upload", "The adoption upload body was not binary data.");
 }
 
 function parseJsonResponse(text: string, parsed: unknown): unknown {
@@ -176,12 +319,13 @@ export function createObsidianEnrollmentRequester(): MirrorEnrollmentRequester {
 export function createObsidianAdoptionRequester(): AuthorityAdoptionRequester {
   return async (request) => {
     if (request.signal?.aborted) throw new DOMException("Collection adoption cancelled.", "AbortError");
+    const body = await adoptionRequestBody(request.body, request.rawBody);
     const response = await requestUrl({
       url: request.url,
       method: request.method,
       headers: request.headers,
-      body: request.body === undefined ? undefined : JSON.stringify(request.body),
-      contentType: request.body === undefined ? undefined : "application/json",
+      body,
+      contentType: body === undefined || request.rawBody ? undefined : "application/json",
       throw: false,
     });
     if (request.signal?.aborted) throw new DOMException("Collection adoption cancelled.", "AbortError");
@@ -189,6 +333,7 @@ export function createObsidianAdoptionRequester(): AuthorityAdoptionRequester {
       status: response.status,
       body: parseJsonResponse(response.text, response.json),
       retryAfterMs: retryAfterMilliseconds(response.headers),
+      headers: response.headers,
     };
   };
 }
@@ -201,10 +346,12 @@ export function createObsidianAdoptionRequester(): AuthorityAdoptionRequester {
 export class ObsidianSyncTransport<Frontmatter extends JsonObject = JsonObject>
 implements SyncTransport<Frontmatter> {
   private readonly syncUrl: string;
+  private readonly filesUrl: string;
 
   constructor(
     syncUrl: string,
     private readonly accessToken: string,
+    private readonly send: typeof requestUrl = requestUrl,
   ) {
     let endpoint: URL;
     try {
@@ -229,6 +376,7 @@ implements SyncTransport<Frontmatter> {
       throw new SyncError("invalid_sync_url", "Sync URL must identify one authority sync endpoint.");
     }
     this.syncUrl = endpoint.href.replace(/\/$/, "");
+    this.filesUrl = this.syncUrl.replace(/\/sync$/u, "/files");
   }
 
   openSession(): Promise<SyncSession> {
@@ -241,6 +389,168 @@ implements SyncTransport<Frontmatter> {
     return this.request("GET", `snapshot?${query.toString()}`);
   }
 
+  fileSnapshot(snapshotId: string, page?: string): Promise<SyncFileSnapshotPage> {
+    const query = new URLSearchParams({ snapshot_id: snapshotId });
+    if (page) query.set("page", page);
+    return this.request("GET", `files/snapshot?${query.toString()}`);
+  }
+
+  async *downloadFile(file: CollectionFileDescriptor): AsyncGenerator<Uint8Array> {
+    const transferId = crypto.randomUUID();
+    try {
+      const session = await this.fileRequest<FileTransferSession>("POST", "downloads", {
+        protocol_version: 1,
+        type: "open_file_download",
+        transfer_id: transferId,
+        file_id: file.file_id,
+        revision: file.revision,
+      });
+      if (
+        session.protocol_version !== 1
+        || session.type !== "file_transfer"
+        || session.transfer_id !== transferId
+        || session.direction !== "download"
+        || session.protection !== "transport_tls"
+        || session.total_size !== file.size
+        || session.strategy.kind !== "object_ranges"
+        || !Number.isSafeInteger(session.strategy.part_size)
+        || session.strategy.part_size <= 0
+      ) {
+        throw new SyncError("invalid_sync_response", "The authority returned an incompatible file download session.");
+      }
+      const partCount = Math.ceil(file.size / session.strategy.part_size);
+      for (let partIndex = 0; partIndex < partCount; partIndex += 1) {
+        const expected = Math.min(session.strategy.part_size, file.size - partIndex * session.strategy.part_size);
+        const response = await this.send({
+          url: `${this.filesUrl}/downloads/${encodeURIComponent(transferId)}/parts/${partIndex}`,
+          method: "GET",
+          headers: { authorization: `Bearer ${this.accessToken}` },
+          throw: false,
+        });
+        if (response.status < 200 || response.status >= 300) throw this.responseError(response, "file_download_failed");
+        const declared = headerValue(response.headers, "content-length");
+        if ((declared !== undefined && Number(declared) !== expected) || response.arrayBuffer.byteLength !== expected) {
+          throw new SyncError("file_integrity_failed", "Hosted authority returned a file part with the wrong length.");
+        }
+        if (expected) yield new Uint8Array(response.arrayBuffer);
+      }
+    } finally {
+      await this.fileRequest("DELETE", `transfers/${encodeURIComponent(transferId)}`).catch(() => undefined);
+    }
+  }
+
+  async uploadFile(
+    request: OpenFileUploadRequest,
+    source: AsyncIterable<Uint8Array>,
+  ): Promise<CommitFileUploadReceipt> {
+    const session = await this.fileRequest<FileTransferSession>("POST", "uploads", request);
+    if (
+      session.protocol_version !== 1
+      || session.type !== "file_transfer"
+      || session.transfer_id !== request.transfer_id
+      || session.direction !== "upload"
+      || session.protection !== "transport_tls"
+      || session.total_size !== request.size
+      || !["object_put", "object_multipart"].includes(session.strategy.kind)
+    ) throw new SyncError("invalid_sync_response", "Authority returned an incompatible file upload session.");
+    const partSize = session.strategy.kind === "object_multipart" ? session.strategy.part_size : Math.max(1, request.size);
+    if (!Number.isSafeInteger(partSize) || partSize <= 0) {
+      throw new SyncError("invalid_sync_response", "Authority returned an invalid upload part size.");
+    }
+    const reader = new BinaryPartReader(source);
+    const count = Math.max(1, Math.ceil(request.size / partSize));
+    if (
+      session.received.some((index) => !Number.isSafeInteger(index) || index < 0 || index >= count)
+      || new Set(session.received).size !== session.received.length
+    ) throw new SyncError("invalid_sync_response", "Authority returned invalid upload progress.");
+    const uploadedParts = session.uploaded_parts ?? [];
+    if (
+      uploadedParts.some((part, index) => !Number.isSafeInteger(part.part_number)
+        || part.part_number < 1
+        || part.part_number > count
+        || !part.etag
+        || part.etag.length > 255
+        || (index > 0 && uploadedParts[index - 1].part_number >= part.part_number))
+      || (session.strategy.kind === "object_multipart"
+        ? uploadedParts.length !== session.received.length
+          || uploadedParts.some((part, index) => part.part_number - 1 !== session.received[index])
+        : uploadedParts.length !== 0)
+    ) throw new SyncError("invalid_sync_response", "Authority returned invalid uploaded part receipts.");
+    if (session.received.length === count) return this.commitUpload(request.transfer_id, uploadedParts);
+    const received = new Set(session.received);
+    const parts = Array.from({ length: count }, () => undefined as { part_number: number; etag: string } | undefined);
+    for (const part of uploadedParts) parts[part.part_number - 1] = part;
+    for (let index = 0; index < count; index += 1) {
+      const offset = index * partSize;
+      const length = Math.min(partSize, Math.max(0, request.size - offset));
+      const bytes = await reader.read(length);
+      if (received.has(index)) continue;
+      const prepared = await this.fileRequest<PreparedFilePart>(
+        "POST",
+        `uploads/${encodeURIComponent(request.transfer_id)}/parts`,
+        {
+          protocol_version: 1,
+          type: "prepare_file_upload_part",
+          transfer_id: request.transfer_id,
+          part_number: index + 1,
+          content_length: length,
+        },
+      );
+      validatePreparedUpload(prepared, request.transfer_id, index, offset, length);
+      const response = await this.send({
+        url: prepared.url,
+        method: "PUT",
+        headers: safeObjectHeaders(prepared.headers),
+        body: bytes.buffer,
+        throw: false,
+      });
+      if (response.status < 200 || response.status >= 300) {
+        throw new SyncError("file_upload_failed", `Object storage returned HTTP ${response.status}.`);
+      }
+      if (session.strategy.kind === "object_multipart") {
+        const etag = headerValue(response.headers, "etag");
+        if (!etag) throw new SyncError("invalid_sync_response", "Object storage omitted a multipart ETag.");
+        parts[index] = { part_number: index + 1, etag };
+      }
+    }
+    await reader.expectEnd();
+    return this.commitUpload(request.transfer_id, parts.filter((part): part is { part_number: number; etag: string } => part !== undefined));
+  }
+
+  private async commitUpload(
+    transferId: string,
+    parts: Array<{ part_number: number; etag: string }>,
+  ): Promise<CommitFileUploadReceipt> {
+    const receipt = await this.fileRequest<CommitFileUploadReceipt>(
+      "POST",
+      `uploads/${encodeURIComponent(transferId)}/commit`,
+      { protocol_version: 1, type: "commit_file_upload", transfer_id: transferId, parts },
+    );
+    if (receipt.protocol_version !== 1 || receipt.type !== "file_upload_committed" || receipt.transfer_id !== transferId) {
+      throw new SyncError("invalid_sync_response", "Authority returned an invalid file upload receipt.");
+    }
+    return receipt;
+  }
+
+  async moveFile(request: MoveFileRequest): Promise<MoveFileReceipt> {
+    const receipt = await this.fileRequest<MoveFileReceipt>("POST", `${encodeURIComponent(request.file_id)}/move`, request);
+    if (receipt.protocol_version !== 1 || receipt.type !== "file_moved" || receipt.mutation_id !== request.mutation_id) {
+      throw new SyncError("invalid_sync_response", "Authority returned an invalid file move receipt.");
+    }
+    return receipt;
+  }
+
+  async deleteFile(request: DeleteFileRequest): Promise<DeleteFileReceipt> {
+    const receipt = await this.fileRequest<DeleteFileReceipt>("POST", `${encodeURIComponent(request.file_id)}/delete`, request);
+    if (
+      receipt.protocol_version !== 1
+      || receipt.type !== "file_deleted"
+      || receipt.mutation_id !== request.mutation_id
+      || receipt.file_id !== request.file_id
+    ) throw new SyncError("invalid_sync_response", "Authority returned an invalid file delete receipt.");
+    return receipt;
+  }
+
   changes(after: number, limit = 200): Promise<SyncChangesPage<Frontmatter>> {
     const query = new URLSearchParams({ after: String(after), limit: String(limit) });
     return this.request("GET", `changes?${query.toString()}`);
@@ -251,8 +561,16 @@ implements SyncTransport<Frontmatter> {
   }
 
   private async request<Result>(method: "GET" | "POST", path: string, body?: unknown): Promise<Result> {
-    const response = await requestUrl({
-      url: `${this.syncUrl}/${path}`,
+    return this.requestAt(this.syncUrl, method, path, body);
+  }
+
+  private async fileRequest<Result>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<Result> {
+    return this.requestAt(this.filesUrl, method, path, body);
+  }
+
+  private async requestAt<Result>(baseUrl: string, method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<Result> {
+    const response = await this.send({
+      url: `${baseUrl}/${path}`,
       method,
       headers: {
         authorization: `Bearer ${this.accessToken}`,
@@ -263,14 +581,105 @@ implements SyncTransport<Frontmatter> {
     });
     const value = parseJsonResponse(response.text, response.json);
     if (response.status < 200 || response.status >= 300) {
-      const error = isRecord(value) && isRecord(value.error) ? value.error : {};
-      throw new SyncError(
-        typeof error.code === "string" ? error.code : "sync_failed",
-        typeof error.message === "string" ? error.message : `Sync request failed (${response.status}).`,
-      );
+      throw this.responseError(response, "sync_failed");
     }
     return value as Result;
   }
+
+  private responseError(
+    response: { status: number; text: string; json: unknown },
+    fallbackCode: string,
+  ): SyncError {
+    const value = parseJsonResponse(response.text, response.json);
+    const error = isRecord(value) && isRecord(value.error) ? value.error : {};
+    return new SyncError(
+      typeof error.code === "string" ? error.code : fallbackCode,
+      typeof error.message === "string" ? error.message : `Sync request failed (${response.status}).`,
+    );
+  }
+}
+
+class BinaryPartReader {
+  private readonly iterator: AsyncIterator<Uint8Array>;
+  private remainder = new Uint8Array();
+
+  constructor(source: AsyncIterable<Uint8Array>) {
+    this.iterator = source[Symbol.asyncIterator]();
+  }
+
+  async read(length: number): Promise<Uint8Array<ArrayBuffer>> {
+    const output = new Uint8Array(new ArrayBuffer(length));
+    let offset = 0;
+    while (offset < length) {
+      if (!this.remainder.byteLength) {
+        const next = await this.iterator.next();
+        if (next.done || !(next.value instanceof Uint8Array)) {
+          throw new SyncError("pending_file_snapshot_corrupt", "Pending file bytes ended early or were invalid.");
+        }
+        this.remainder = Uint8Array.from(next.value);
+        if (!this.remainder.byteLength) continue;
+      }
+      const count = Math.min(length - offset, this.remainder.byteLength);
+      output.set(this.remainder.subarray(0, count), offset);
+      offset += count;
+      this.remainder = this.remainder.slice(count);
+    }
+    return output;
+  }
+
+  async expectEnd(): Promise<void> {
+    if (this.remainder.byteLength) throw new SyncError("pending_file_snapshot_corrupt", "Pending file bytes are oversized.");
+    while (true) {
+      const next = await this.iterator.next();
+      if (next.done) return;
+      if (!(next.value instanceof Uint8Array) || next.value.byteLength) {
+        throw new SyncError("pending_file_snapshot_corrupt", "Pending file bytes are oversized.");
+      }
+    }
+  }
+}
+
+function validatePreparedUpload(
+  part: PreparedFilePart,
+  transferId: string,
+  partIndex: number,
+  offset: number,
+  contentLength: number,
+): void {
+  let url: URL;
+  try {
+    url = new URL(part.url);
+  } catch {
+    throw new SyncError("invalid_sync_response", "Authority returned an invalid object URL.");
+  }
+  if (
+    part.protocol_version !== 1
+    || part.type !== "file_part"
+    || part.transfer_id !== transferId
+    || part.part_index !== partIndex
+    || part.offset !== offset
+    || part.content_length !== contentLength
+    || part.method.toUpperCase() !== "PUT"
+    || !secureHttpEndpoint(url)
+    || url.username
+    || url.password
+    || !url.hostname
+  ) throw new SyncError("invalid_sync_response", "Authority returned an invalid prepared upload part.");
+}
+
+function secureHttpEndpoint(url: URL): boolean {
+  return url.protocol === "https:"
+    || (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname));
+}
+
+function safeObjectHeaders(headers: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(headers).filter(([name]) =>
+    !["authorization", "cookie", "host", "proxy-authorization", "content-length"].includes(name.toLowerCase())));
+}
+
+function headerValue(headers: Record<string, string>, name: string): string | undefined {
+  const match = Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase());
+  return match?.[1];
 }
 
 function safeMirrorPath(input: string): string {
@@ -279,6 +688,53 @@ function safeMirrorPath(input: string): string {
     throw new SyncError("unsafe_mirror_path", `The collection authority attempted to write a reserved path: ${path}`);
   }
   return path;
+}
+
+function abortIfNeeded(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("Synchronization cancelled.", "AbortError");
+}
+
+function abortableSyncTransport(
+  transport: SyncTransport<JsonObject>,
+  signal?: AbortSignal,
+): SyncTransport<JsonObject> {
+  const run = async <Value>(operation: () => Promise<Value>): Promise<Value> => {
+    abortIfNeeded(signal);
+    const value = await operation();
+    abortIfNeeded(signal);
+    return value;
+  };
+  const stream = async function* (source: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+    for await (const chunk of source) {
+      abortIfNeeded(signal);
+      yield chunk;
+    }
+    abortIfNeeded(signal);
+  };
+  return {
+    openSession: () => run(() => transport.openSession()),
+    snapshot: (snapshotId, page) => run(() => transport.snapshot(snapshotId, page)),
+    fileSnapshot: (snapshotId, page) => run(() => transport.fileSnapshot(snapshotId, page)),
+    downloadFile: (file) => stream(transport.downloadFile(file)),
+    ...(transport.uploadFile ? {
+      uploadFile: (request, source) => run(() => transport.uploadFile!(request, stream(source))),
+    } : {}),
+    ...(transport.moveFile ? { moveFile: (request) => run(() => transport.moveFile!(request)) } : {}),
+    ...(transport.deleteFile ? { deleteFile: (request) => run(() => transport.deleteFile!(request)) } : {}),
+    changes: (after, limit) => run(() => transport.changes(after, limit)),
+    mutate: (mutation) => run(() => transport.mutate(mutation)),
+  };
+}
+
+function deduplicatePreviewEntries(entries: readonly SyncPreviewEntry[]): SyncPreviewEntry[] {
+  const result = new Map<string, SyncPreviewEntry>();
+  for (const entry of entries) {
+    const key = `${entry.kind}\u0000${entry.direction}\u0000${entry.path}\u0000${entry.action}`;
+    result.set(key, entry);
+  }
+  return [...result.values()].sort((left, right) =>
+    left.direction.localeCompare(right.direction) || left.path.localeCompare(right.path),
+  );
 }
 
 async function ensureFolder(vault: Vault, path: string): Promise<void> {
@@ -340,6 +796,212 @@ export class ObsidianMirrorFileSystem implements MirrorFileSystem {
       .filter((path) => !excluded.has(path))
       .filter((path) => !RESERVED_WRITE_PREFIXES.some((prefix) => path.startsWith(prefix)))
       .sort();
+  }
+
+  async inspectBinary(input: string): Promise<MirrorBinaryInfo | null> {
+    const path = assertVisibleBinaryPath(input);
+    const file = this.vault.getAbstractFileByPath(path);
+    if (file == null) return null;
+    if (!(file instanceof TFile)) throw new SyncError("mirror_path_collision", `Expected a file at ${path}.`);
+    return binaryInfo(await this.vault.readBinary(file));
+  }
+
+  async writeBinary(input: string, source: AsyncIterable<Uint8Array>): Promise<void> {
+    const path = assertVisibleBinaryPath(input);
+    const bytes = await collectBinary(source);
+    const slash = path.lastIndexOf("/");
+    if (slash >= 0) await ensureFolder(this.vault, path.slice(0, slash));
+    const existing = this.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFolder) throw new SyncError("mirror_path_collision", `A folder blocks the mirror file ${path}.`);
+    if (existing instanceof TFile) await this.vault.modifyBinary(existing, bytes);
+    else await this.vault.createBinary(path, bytes);
+  }
+
+  async listBinary(excluded: ReadonlySet<string>): Promise<string[]> {
+    return listFiles(this.vault)
+      .map((file) => normalizePath(file.path))
+      .filter((path) => !/\.md$/i.test(path) && !excluded.has(path))
+      .filter((path) => {
+        try {
+          assertVisibleBinaryPath(path);
+          return true;
+        } catch {
+          return false;
+        }
+      })
+      .sort();
+  }
+
+  async readBinary(input: string): Promise<AsyncIterable<Uint8Array> | null> {
+    const path = assertVisibleBinaryPath(input);
+    const file = this.vault.getAbstractFileByPath(path);
+    if (file == null) return null;
+    if (!(file instanceof TFile)) throw new SyncError("mirror_path_collision", `Expected a file at ${path}.`);
+    const bytes = new Uint8Array(await this.vault.readBinary(file));
+    return (async function* (): AsyncGenerator<Uint8Array> {
+      for (let offset = 0; offset < bytes.byteLength; offset += BLOB_CHUNK_BYTES) {
+        yield bytes.subarray(offset, Math.min(bytes.byteLength, offset + BLOB_CHUNK_BYTES));
+      }
+    })();
+  }
+}
+
+interface BlobManifest {
+  stage: string;
+  chunks: number;
+  size: number;
+}
+
+export class IndexedDbMirrorBlobStore implements MirrorBlobStore {
+  private database: Promise<IDBDatabase> | null = null;
+
+  constructor(private readonly namespace: string) {}
+
+  async has(contentDigest: `sha256:${string}`): Promise<boolean> {
+    return (await this.manifest(contentDigest)) !== null;
+  }
+
+  async *read(contentDigest: `sha256:${string}`): AsyncGenerator<Uint8Array> {
+    const manifest = await this.manifest(contentDigest);
+    if (!manifest) throw new SyncError("file_blob_missing", "A staged binary snapshot is missing.");
+    let size = 0;
+    for (let index = 0; index < manifest.chunks; index += 1) {
+      const chunk = await this.get<ArrayBuffer>(BLOB_CHUNK_STORE, this.chunkKey(manifest.stage, index));
+      if (!(chunk instanceof ArrayBuffer)) throw new SyncError("file_blob_corrupt", "A staged binary snapshot is incomplete.");
+      size += chunk.byteLength;
+      yield new Uint8Array(chunk);
+    }
+    if (size !== manifest.size) throw new SyncError("file_blob_corrupt", "A staged binary snapshot has the wrong size.");
+  }
+
+  async write(contentDigest: `sha256:${string}`, source: AsyncIterable<Uint8Array>): Promise<void> {
+    const previous = await this.manifest(contentDigest);
+    const stage = crypto.randomUUID();
+    let chunks = 0;
+    let size = 0;
+    try {
+      for await (const sourceChunk of source) {
+        if (!(sourceChunk instanceof Uint8Array)) throw new SyncError("file_blob_corrupt", "A staged binary chunk is invalid.");
+        for (let offset = 0; offset < sourceChunk.byteLength; offset += BLOB_CHUNK_BYTES) {
+          const chunk = Uint8Array.from(sourceChunk.subarray(offset, offset + BLOB_CHUNK_BYTES));
+          size += chunk.byteLength;
+          if (!Number.isSafeInteger(size)) throw new SyncError("file_too_large", "The binary file is too large for this device.");
+          await this.put(BLOB_CHUNK_STORE, this.chunkKey(stage, chunks), chunk.buffer);
+          chunks += 1;
+        }
+      }
+      await this.put(BLOB_MANIFEST_STORE, this.manifestKey(contentDigest), { stage, chunks, size } satisfies BlobManifest);
+      if (previous && previous.stage !== stage) await this.removeStage(previous.stage, previous.chunks);
+    } catch (error) {
+      await this.removeStage(stage, chunks).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async remove(contentDigest: `sha256:${string}`): Promise<void> {
+    const manifest = await this.manifest(contentDigest);
+    await this.delete(BLOB_MANIFEST_STORE, this.manifestKey(contentDigest));
+    if (manifest) await this.removeStage(manifest.stage, manifest.chunks);
+  }
+
+  async prune(retained: ReadonlySet<`sha256:${string}`>): Promise<void> {
+    const database = await this.open();
+    const manifests = await new Promise<Array<[IDBValidKey, BlobManifest]>>((resolve, reject) => {
+      const result: Array<[IDBValidKey, BlobManifest]> = [];
+      const request = database.transaction(BLOB_MANIFEST_STORE, "readonly").objectStore(BLOB_MANIFEST_STORE).openCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return resolve(result);
+        result.push([cursor.key, cursor.value as BlobManifest]);
+        cursor.continue();
+      };
+      request.onerror = () => reject(request.error);
+    });
+    const retainedStages = new Set<string>();
+    for (const [key, manifest] of manifests) {
+      if (!Array.isArray(key) || key[0] !== this.namespace || retained.has(key[1] as `sha256:${string}`)) continue;
+      await this.delete(BLOB_MANIFEST_STORE, key);
+      await this.removeStage(manifest.stage, manifest.chunks);
+    }
+    for (const [key, manifest] of manifests) {
+      if (Array.isArray(key) && key[0] === this.namespace && retained.has(key[1] as `sha256:${string}`)) {
+        retainedStages.add(manifest.stage);
+      }
+    }
+    const orphanKeys = await new Promise<IDBValidKey[]>((resolve, reject) => {
+      const result: IDBValidKey[] = [];
+      const request = database.transaction(BLOB_CHUNK_STORE, "readonly").objectStore(BLOB_CHUNK_STORE).openKeyCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return resolve(result);
+        const key = cursor.key;
+        if (Array.isArray(key) && key[0] === this.namespace && !retainedStages.has(String(key[1]))) result.push(key);
+        cursor.continue();
+      };
+      request.onerror = () => reject(request.error);
+    });
+    for (const key of orphanKeys) await this.delete(BLOB_CHUNK_STORE, key);
+  }
+
+  private manifest(contentDigest: `sha256:${string}`): Promise<BlobManifest | null> {
+    return this.get<BlobManifest>(BLOB_MANIFEST_STORE, this.manifestKey(contentDigest));
+  }
+
+  private manifestKey(contentDigest: string): IDBValidKey {
+    return [this.namespace, contentDigest];
+  }
+
+  private chunkKey(stage: string, index: number): IDBValidKey {
+    return [this.namespace, stage, index];
+  }
+
+  private async removeStage(stage: string, chunks: number): Promise<void> {
+    for (let index = 0; index < chunks; index += 1) await this.delete(BLOB_CHUNK_STORE, this.chunkKey(stage, index));
+  }
+
+  private async get<Value>(storeName: string, key: IDBValidKey): Promise<Value | null> {
+    const database = await this.open();
+    return new Promise((resolve, reject) => {
+      const request = database.transaction(storeName, "readonly").objectStore(storeName).get(key);
+      request.onsuccess = () => resolve((request.result as Value | undefined) ?? null);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  private async put(storeName: string, key: IDBValidKey, value: unknown): Promise<void> {
+    const database = await this.open();
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(storeName, "readwrite");
+      transaction.objectStore(storeName).put(value, key);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+  }
+
+  private async delete(storeName: string, key: IDBValidKey): Promise<void> {
+    const database = await this.open();
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(storeName, "readwrite");
+      transaction.objectStore(storeName).delete(key);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+  }
+
+  private open(): Promise<IDBDatabase> {
+    if (typeof indexedDB === "undefined") throw new SyncError("storage_unavailable", "IndexedDB is required for binary file sync.");
+    this.database ??= new Promise((resolve, reject) => {
+      const request = indexedDB.open(BLOB_DATABASE, 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(BLOB_MANIFEST_STORE)) request.result.createObjectStore(BLOB_MANIFEST_STORE);
+        if (!request.result.objectStoreNames.contains(BLOB_CHUNK_STORE)) request.result.createObjectStore(BLOB_CHUNK_STORE);
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    return this.database;
   }
 }
 
@@ -406,6 +1068,8 @@ export class DeviceMirrorLease implements MirrorLease {
 
 export interface ConnectSyncControllerOptions {
   stateStoreFactory?: (profile: MirrorProfile) => MirrorStateStore;
+  blobStoreFactory?: (profile: MirrorProfile) => MirrorBlobStore;
+  adoptionBlobStoreFactory?: (collectionId: string) => MirrorBlobStore;
   fileSystem?: MirrorFileSystem;
   leaseFactory?: (profile: MirrorProfile) => MirrorLease;
   enrollmentClient?: MirrorEnrollmentClient;
@@ -418,6 +1082,7 @@ export interface ConnectSyncControllerOptions {
 
 export class ConnectSyncController {
   private progress: MirrorProgress | null = null;
+  private syncAbort: AbortController | null = null;
   private readonly fileSystem: MirrorFileSystem;
   private readonly enrollmentClient: MirrorEnrollmentClient;
   private readonly adoptionClient: AuthorityAdoptionClient;
@@ -455,6 +1120,17 @@ export class ConnectSyncController {
     return this.adoptionMarker ? JSON.parse(JSON.stringify(this.adoptionMarker)) as AdoptionMarker : null;
   }
 
+  getSelectiveSync(): SelectiveSyncPolicy {
+    return normalizeSelectiveSync(
+      this.settingsHost.getMirrorProfile()?.selectiveSync ?? this.adoptionMarker?.selective_sync,
+    );
+  }
+
+  async configureSelectiveSync(policy: SelectiveSyncPolicy): Promise<void> {
+    const profile = this.requireProfile();
+    await this.settingsHost.saveMirrorProfile({ ...profile, selectiveSync: normalizeSelectiveSync(policy) });
+  }
+
   assertLocalAuthorityWritable(): void {
     if (this.adoptionMarker && ["fenced", "activating", "adopted"].includes(this.adoptionMarker.phase)) {
       throw new SyncError(
@@ -488,6 +1164,7 @@ export class ConnectSyncController {
       version: 1,
       phase: "waiting_for_approval",
       session: publicAdoptionSession(session),
+      selective_sync: normalizeSelectiveSync(input.selectiveSync),
       manifest_digest: null,
       source_revision: null,
       source_head: null,
@@ -549,12 +1226,14 @@ export class ConnectSyncController {
   ): Promise<MirrorProfile> {
     const collectionId = await this.assertCanBecomeMirror(input.collectionId);
     const enrollment = await this.enrollmentClient.enroll({
-      ...input,
+      controlUrl: input.controlUrl,
+      mirrorName: input.mirrorName,
+      mode: input.mode,
       ...(collectionId ? { collectionId } : {}),
     }, callbacks);
     const markerCreated = await this.markMirror(enrollment.collectionId);
     try {
-      await this.persistEnrollment(enrollment);
+      await this.persistEnrollment(enrollment, input.selectiveSync);
     } catch (error) {
       if (markerCreated) {
         try {
@@ -571,9 +1250,13 @@ export class ConnectSyncController {
     return this.requireProfile();
   }
 
-  async preview(): Promise<MirrorInitializationPreview> {
-    const mirror = await this.createMirror();
-    return mirror.previewInitialization();
+  async preview(): Promise<MdbaseSyncPreview> {
+    const profile = this.requireProfile();
+    await this.assertMirror(profile.collectionId);
+    const state = await this.stateStoreFor(profile).read();
+    return state
+      ? this.previewIncremental(profile, state)
+      : this.previewInitial(profile, "initial");
   }
 
   async status(): Promise<MirrorStatus | null> {
@@ -585,21 +1268,43 @@ export class ConnectSyncController {
   }
 
   async sync(onProgress?: (progress: MirrorProgress) => void): Promise<MirrorStatus> {
-    const mirror = await this.createMirror((next) => {
-      this.progress = next;
-      onProgress?.({ ...next });
-    });
+    if (this.syncAbort) {
+      throw new SyncError("mirror_busy", "Synchronization is already running for this vault.");
+    }
+    const abort = new AbortController();
+    this.syncAbort = abort;
     try {
+      const mirror = await this.createMirror((next) => {
+        abortIfNeeded(abort.signal);
+        this.progress = next;
+        onProgress?.({ ...next });
+      }, abort.signal);
       await mirror.sync();
+      abortIfNeeded(abort.signal);
       return mirror.status();
     } finally {
       this.progress = null;
+      this.syncAbort = null;
     }
+  }
+
+  cancelSync(): void {
+    this.syncAbort?.abort();
+  }
+
+  isSyncing(): boolean {
+    return this.syncAbort !== null;
   }
 
   async resolveConflict(recordId: string, resolution: "local" | "remote"): Promise<MirrorStatus> {
     const mirror = await this.createMirror();
     await mirror.resolveConflict(recordId, resolution);
+    return mirror.status();
+  }
+
+  async resolveFileConflict(fileId: string, resolution: "local" | "remote"): Promise<MirrorStatus> {
+    const mirror = await this.createMirror();
+    await mirror.resolveFileConflict(fileId, resolution);
     return mirror.status();
   }
 
@@ -632,7 +1337,7 @@ export class ConnectSyncController {
         completed = exchanged;
       } else {
         if (exchanged.status === "ready") {
-          await this.adoptionClient.uploadSnapshot(session, exchanged, snapshot, callbacks);
+          await this.adoptionClient.uploadSnapshot(session, exchanged, snapshot, this.adoptionUploadOptions(session, callbacks));
         }
         await this.updateAdoptionPhase("activating", snapshot);
         completed = await this.adoptionClient.complete(session, snapshot, callbacks);
@@ -643,7 +1348,7 @@ export class ConnectSyncController {
         : await this.requirePreparedAdoption(session, callbacks);
       const warmSnapshot = await this.captureAuthoritySnapshot(session.requested.collectionId);
       await this.updateAdoptionPhase("uploading");
-      await this.adoptionClient.uploadSnapshot(session, prepared, warmSnapshot, callbacks);
+      await this.adoptionClient.uploadSnapshot(session, prepared, warmSnapshot, this.adoptionUploadOptions(session, callbacks));
 
       // From this point local plugin writes are stopped. Any external file edit is
       // a pending mirror write, not part of the authority snapshot being activated.
@@ -651,7 +1356,7 @@ export class ConnectSyncController {
       await this.writeAdoptionSnapshot(finalSnapshot);
       await this.updateAdoptionPhase("fenced", finalSnapshot);
       const finalPrepared = await this.requirePreparedAdoption(session, callbacks);
-      await this.adoptionClient.uploadSnapshot(session, finalPrepared, finalSnapshot, callbacks);
+      await this.adoptionClient.uploadSnapshot(session, finalPrepared, finalSnapshot, this.adoptionUploadOptions(session, callbacks));
       await this.updateAdoptionPhase("activating", finalSnapshot);
       completed = await this.adoptionClient.complete(session, finalSnapshot, callbacks);
     }
@@ -731,7 +1436,7 @@ export class ConnectSyncController {
     }
     const markerCreated = await this.markMirror(enrollment.collectionId);
     try {
-      await this.persistEnrollment(enrollment);
+      await this.persistEnrollment(enrollment, this.adoptionMarker?.selective_sync);
     } catch (error) {
       if (markerCreated) await this.app.vault.adapter.remove(ROLE_MARKER_PATH);
       throw error;
@@ -788,13 +1493,60 @@ export class ConnectSyncController {
         document,
       });
     }
+    const files: CollectionFileDescriptor[] = [];
+    const policy = normalizeSelectiveSync(this.adoptionMarker?.selective_sync);
+    if (policy.file_classes.length) {
+      const blobStore = this.adoptionBlobStore(collectionId);
+      const binaryPaths = (await this.fileSystem.listBinary?.(new Set(resources.map((resource) => resource.path))) ?? [])
+        .filter((path) => binaryPathSelected(policy, path))
+        .filter((path) => !isExcluded(path, config));
+      for (const path of binaryPaths) {
+        const source = await this.fileSystem.readBinary?.(path);
+        if (!source) continue;
+        const bytes = await collectBinary(source);
+        const info = await binaryInfo(bytes);
+        await blobStore.write(info.content_digest, (async function* () { yield new Uint8Array(bytes); })());
+        const file = this.app.vault.getAbstractFileByPath(path);
+        files.push({
+          file_id: portableRecordId(collectionId, `file:${path}`),
+          path,
+          revision: info.content_digest,
+          ...info,
+          ...(mediaTypeForPath(path) ? { media_type: mediaTypeForPath(path) } : {}),
+          media_class: classifyBinaryPath(path),
+          modified_at: new Date(file instanceof TFile && file.stat?.mtime ? file.stat.mtime : Date.now()).toISOString(),
+        });
+      }
+    }
     return buildPortableAuthoritySnapshot({
       collectionId,
       sourceHead: 0,
       specVersion: config.spec_version,
       resources,
       records,
+      files,
     });
+  }
+
+  private adoptionBlobStore(collectionId: string): MirrorBlobStore {
+    return this.options.adoptionBlobStoreFactory?.(collectionId)
+      ?? new IndexedDbMirrorBlobStore(`adoption:${collectionId}`);
+  }
+
+  private adoptionUploadOptions(
+    session: AuthorityAdoptionSession,
+    callbacks: AdoptLocalCollectionCallbacks,
+  ) {
+    const blobStore = this.adoptionBlobStore(session.requested.collectionId);
+    return {
+      signal: callbacks.signal,
+      fileSource: async (file: CollectionFileDescriptor) => collectBinary(blobStore.read(file.content_digest)),
+      onFileProgress: ({ file, transferredBytes, totalBytes }: {
+        file: CollectionFileDescriptor;
+        transferredBytes: number;
+        totalBytes: number;
+      }) => callbacks.onFileProgress?.(file.path, transferredBytes, totalBytes),
+    };
   }
 
   private async ensurePortableCollectionIdentity(): Promise<{
@@ -839,16 +1591,269 @@ export class ConnectSyncController {
     return { collectionId, displayName };
   }
 
-  private async createMirror(onProgress?: (progress: MirrorProgress) => void): Promise<DirectoryMirror<JsonObject>> {
-    const profile = this.requireProfile();
-    await this.assertMirror(profile.collectionId);
+  private async previewInitial(
+    profile: MirrorProfile,
+    phase: "initial" | "rebuild",
+  ): Promise<MdbaseSyncPreview> {
+    const mirror = await this.createMirror();
+    const base = await mirror.previewInitialization();
+    const transport = await this.transportFor(profile);
+    const session = await transport.openSession();
+    const policy = normalizeSelectiveSync(profile.selectiveSync);
+    const entries: SyncPreviewEntry[] = [];
+    const remotePaths = new Set<string>();
+    const remoteBinaryPaths = new Set<string>();
+
+    const compareRemote = async (path: string, document: string, detail: string): Promise<void> => {
+      remotePaths.add(path);
+      const local = await this.fileSystem.read(path);
+      if (local === document) return;
+      entries.push(local === null ? {
+        kind: "document",
+        path,
+        direction: "download",
+        action: "create",
+        detail,
+      } : {
+        kind: "document",
+        path,
+        direction: "attention",
+        action: "replace",
+        detail: "A different local file already uses this hosted path.",
+      });
+    };
+
+    for (const resource of session.resources.documents ?? []) {
+      await compareRemote(resource.path, resource.document, `Download hosted ${resource.kind}.`);
+    }
+    let page: string | undefined;
+    do {
+      const snapshot = await transport.snapshot(session.snapshot_id, page);
+      for (const record of snapshot.records) {
+        await compareRemote(record.path, record.document, "Download hosted document.");
+      }
+      page = snapshot.next_page;
+    } while (page);
+
+    if (policy.file_classes.length) {
+      let filePage: string | undefined;
+      do {
+        const snapshot = await transport.fileSnapshot(session.snapshot_id, filePage);
+        for (const file of snapshot.files) {
+          assertVisibleBinaryPath(file.path);
+          if (!binaryPathSelected(policy, file.path, file.media_class)) continue;
+          remoteBinaryPaths.add(file.path);
+          const local = await this.fileSystem.inspectBinary(file.path);
+          if (local?.size === file.size && local.content_digest === file.content_digest) continue;
+          entries.push(local === null ? {
+            kind: "file",
+            path: file.path,
+            direction: "download",
+            action: "create",
+            detail: `Download hosted ${file.media_class} file · ${formatByteCount(file.size)}.`,
+            fileId: file.file_id,
+          } : {
+            kind: "file",
+            path: file.path,
+            direction: "attention",
+            action: "replace",
+            detail: "A different local file already uses this hosted path.",
+            fileId: file.file_id,
+          });
+        }
+        filePage = snapshot.next_page;
+      } while (filePage);
+    }
+
+    if (profile.mode === "read_write") {
+      const resourcePaths = new Set((session.resources.documents ?? []).map((resource) => resource.path));
+      const configuration = await loadMdbaseConfig(this.app.vault);
+      const localPaths = (await this.fileSystem.listMarkdown(resourcePaths))
+        .filter((path) => !remotePaths.has(path))
+        .filter((path) => !configuration || !isExcluded(path, configuration));
+      const invalid = new Set(base.local_issues.map((issue) => issue.path));
+      for (const path of localPaths) {
+        if (invalid.has(path)) continue;
+        entries.push({
+          kind: "document",
+          path,
+          direction: "upload",
+          action: "create",
+          detail: "Add this local document to the hosted collection.",
+        });
+      }
+      if (policy.file_classes.length && this.fileSystem.listBinary) {
+        const localBinaryPaths = (await this.fileSystem.listBinary(new Set([...resourcePaths, ...remotePaths])))
+          .filter((path) => binaryPathSelected(policy, path))
+          .filter((path) => !remoteBinaryPaths.has(path))
+          .filter((path) => !configuration || !isExcluded(path, configuration));
+        for (const path of localBinaryPaths) {
+          entries.push({
+            kind: "file",
+            path,
+            direction: "upload",
+            action: "create",
+            detail: "Add this local file to the hosted collection.",
+          });
+        }
+      }
+    }
+    for (const issue of base.local_issues) {
+      entries.push({
+        kind: "document",
+        path: issue.path,
+        direction: "attention",
+        action: "fix",
+        detail: issue.message,
+      });
+    }
+
+    return {
+      ...base,
+      phase,
+      entries: deduplicatePreviewEntries(flagConcurrentFileChanges(entries)),
+      cursor: null,
+      remoteHead: session.head,
+    };
+  }
+
+  private async previewIncremental(
+    profile: MirrorProfile,
+    state: MirrorState,
+  ): Promise<MdbaseSyncPreview> {
+    const policy = normalizeSelectiveSync(profile.selectiveSync);
+    if (JSON.stringify(normalizeSelectiveSync(state.selective_sync)) !== JSON.stringify(policy)) {
+      return this.previewInitial(profile, "rebuild");
+    }
+    const transport = await this.transportFor(profile);
+    const session = await transport.openSession();
+    const events: SyncChange[] = [];
+    let cursor = state.cursor;
+    let remoteHead = session.head;
+    while (true) {
+      const page = await transport.changes(cursor, 200);
+      remoteHead = page.head;
+      if (page.scope_epoch !== state.scope_epoch || page.reset_required) {
+        return this.previewInitial(profile, "rebuild");
+      }
+      events.push(...page.events);
+      cursor = page.cursor;
+      if (!page.has_more) break;
+    }
+
+    const resourcePaths = new Set(Object.keys(state.resources ?? {}));
+    const configuration = await loadMdbaseConfig(this.app.vault);
+    const localPaths = (await this.fileSystem.listMarkdown(resourcePaths))
+      .filter((path) => !configuration || !isExcluded(path, configuration));
+    const pathsToRead = new Set([
+      ...localPaths,
+      ...Object.values(state.records).map((entry) => entry.path),
+    ]);
+    const documents = new Map<string, string | null>();
+    await Promise.all([...pathsToRead].map(async (path) => {
+      documents.set(path, await this.fileSystem.read(path));
+    }));
+
+    const binaryPaths = policy.file_classes.length && this.fileSystem.listBinary
+      ? (await this.fileSystem.listBinary(new Set([...resourcePaths, ...localPaths])))
+        .filter((path) => binaryPathSelected(policy, path))
+        .filter((path) => !configuration || !isExcluded(path, configuration))
+      : [];
+    const binary = new Map<string, MirrorBinaryInfo>();
+    await Promise.all(binaryPaths.map(async (path) => {
+      const info = await this.fileSystem.inspectBinary(path);
+      if (info) binary.set(path, info);
+    }));
+
+    const entries = [
+      ...remoteChangeEntries(state, events),
+      ...remoteFileChangeEntries(state, events, (file) => binaryPathSelected(policy, file.path, file.media_class)),
+      ...localChangeEntries(state, documents, localPaths, resourcePaths, portableMirrorRuntime.digest),
+      ...localFileChangeEntries(state, binary, binaryPaths),
+    ];
+    for (const [recordId, receipt] of Object.entries(state.conflicts ?? {})) {
+      const pending = state.pending?.find((item) => item.mutation.record_id === recordId);
+      const path = pending?.local_path ?? state.records[recordId]?.path ?? "Unknown document";
+      entries.push({
+        kind: "document",
+        path,
+        direction: "attention",
+        action: "fix",
+        detail: receipt.status === "conflicted"
+          ? "Local and hosted changes need a decision."
+          : receipt.status === "rejected"
+            ? receipt.error.message
+            : "A queued local change needs review.",
+        recordId,
+      });
+    }
+    for (const issue of Object.values(state.local_issues ?? {})) {
+      entries.push({
+        kind: "document",
+        path: issue.path,
+        direction: "attention",
+        action: "fix",
+        detail: issue.message,
+      });
+    }
+    for (const conflict of Object.values(state.file_conflicts ?? {})) {
+      entries.push({
+        kind: "file",
+        path: conflict.path,
+        direction: "attention",
+        action: "fix",
+        detail: conflict.message,
+        fileId: conflict.file_id,
+      });
+    }
+
+    return summarizePreview({
+      already_initialized: true,
+      unchanged_documents: Math.max(0, Object.keys(state.records).length
+        - events.filter((event) => event.type === "put" || event.type === "remove").length),
+      unchanged_files: Math.max(0, Object.keys(state.files ?? {}).length
+        - events.filter((event) => event.type === "file_put" || event.type === "file_remove").length),
+      collisions: [],
+      local_issues: Object.values(state.local_issues ?? {}).map(({ path, code, message }) => ({ path, code, message })),
+      phase: "incremental",
+      entries: deduplicatePreviewEntries(flagConcurrentFileChanges(entries)),
+      cursor: state.cursor,
+      remoteHead,
+    });
+  }
+
+  private stateStoreFor(profile: MirrorProfile): MirrorStateStore {
+    return this.options.stateStoreFactory?.(profile)
+      ?? new IndexedDbMirrorStateStore(`${profile.collectionId}:${profile.replicaId}`);
+  }
+
+  private blobStoreFor(profile: MirrorProfile): MirrorBlobStore {
+    return this.options.blobStoreFactory?.(profile)
+      ?? new IndexedDbMirrorBlobStore(`${profile.collectionId}:${profile.replicaId}`);
+  }
+
+  private async transportFor(
+    profile: MirrorProfile,
+    signal?: AbortSignal,
+  ): Promise<SyncTransport<JsonObject>> {
     const accessToken = await this.freshAccessToken(profile);
     const transport = this.options.transportFactory?.(profile, accessToken)
       ?? new ObsidianSyncTransport(profile.syncUrl, accessToken);
+    return abortableSyncTransport(transport, signal);
+  }
+
+  private async createMirror(
+    onProgress?: (progress: MirrorProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<DirectoryMirror<JsonObject>> {
+    const profile = this.requireProfile();
+    await this.assertMirror(profile.collectionId);
+    const transport = await this.transportFor(profile, signal);
     const mirrorOptions: DirectoryMirrorOptions = {
-      stateStore: this.options.stateStoreFactory?.(profile)
-        ?? new IndexedDbMirrorStateStore(`${profile.collectionId}:${profile.replicaId}`),
+      stateStore: this.stateStoreFor(profile),
       fileSystem: this.fileSystem,
+      blobStore: this.blobStoreFor(profile),
+      selectiveSync: normalizeSelectiveSync(profile.selectiveSync),
       lease: this.options.leaseFactory?.(profile)
         ?? new DeviceMirrorLease(`${profile.collectionId}:${profile.replicaId}`),
       onProgress,
@@ -880,7 +1885,7 @@ export class ConnectSyncController {
     this.app.secretStorage.setSecret(this.adoptionSecretId(session.adoptionId), session.credential);
   }
 
-  private async persistEnrollment(enrollment: MirrorEnrollment): Promise<void> {
+  private async persistEnrollment(enrollment: MirrorEnrollment, selectiveSync?: SelectiveSyncPolicy): Promise<void> {
     this.app.secretStorage.setSecret(this.accessSecretId(enrollment.collectionId), enrollment.accessToken);
     this.app.secretStorage.setSecret(this.refreshSecretId(enrollment.collectionId), enrollment.refreshCredential);
     await this.settingsHost.saveMirrorProfile({
@@ -893,6 +1898,7 @@ export class ConnectSyncController {
       name: enrollment.name,
       enrollmentId: enrollment.enrollmentId,
       accessTokenExpiresAt: enrollment.accessTokenExpiresAt,
+      selectiveSync: normalizeSelectiveSync(selectiveSync ?? this.settingsHost.getMirrorProfile()?.selectiveSync),
     });
   }
 
@@ -919,7 +1925,7 @@ export class ConnectSyncController {
       refreshCredential,
       accessTokenExpiresAt: profile.accessTokenExpiresAt,
     });
-    await this.persistEnrollment(renewed);
+    await this.persistEnrollment(renewed, profile.selectiveSync);
     return renewed.accessToken;
   }
 
@@ -1138,6 +2144,7 @@ export class ConnectSyncController {
   }
 
   private async clearAdoptionCheckpoint(adoptionId: string): Promise<void> {
+    const collectionId = this.adoptionMarker?.session.requested.collectionId;
     if (await this.app.vault.adapter.exists(ADOPTION_MARKER_PATH)) {
       await this.app.vault.adapter.remove(ADOPTION_MARKER_PATH);
     }
@@ -1148,6 +2155,9 @@ export class ConnectSyncController {
     // makes the one-time adoption credential unusable without writing it to disk.
     this.app.secretStorage.setSecret(this.adoptionSecretId(adoptionId), "");
     this.adoptionMarker = null;
+    if (collectionId) {
+      await this.adoptionBlobStore(collectionId).prune(new Set()).catch(() => undefined);
+    }
   }
 }
 
@@ -1211,7 +2221,19 @@ function validAdoptionMarker(value: unknown): value is AdoptionMarker {
     && typeof session.requested.displayName === "string"
     && typeof session.requested.sourceName === "string"
     && session.requested.retainMirror === true
+    && (value.selective_sync === undefined || validSelectiveSync(value.selective_sync))
     && (value.manifest_digest === null || typeof value.manifest_digest === "string")
     && (value.source_revision === null || typeof value.source_revision === "string")
     && (value.source_head === null || Number.isSafeInteger(value.source_head));
+}
+
+function validSelectiveSync(value: unknown): value is SelectiveSyncPolicy {
+  if (!isRecord(value) || !Array.isArray(value.file_classes) || !Array.isArray(value.excluded_folders)) return false;
+  try {
+    const normalized = normalizeSelectiveSync(value as unknown as SelectiveSyncPolicy);
+    return normalized.file_classes.length === value.file_classes.length
+      && normalized.excluded_folders.length === value.excluded_folders.length;
+  } catch {
+    return false;
+  }
 }

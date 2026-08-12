@@ -4,8 +4,10 @@ import { readFile } from "node:fs/promises";
 const bundle = await readFile(new URL("../main.js", import.meta.url));
 const source = bundle.toString("utf8");
 const gzipBytes = gzipSync(bundle).byteLength;
-const rawBudget = 550 * 1024;
-const gzipBudget = 170 * 1024;
+// beta.31 adds the complete digest-verified collection-file data plane. Keep a
+// narrow margin over its measured production bundle so later growth is visible.
+const rawBudget = 640 * 1024;
+const gzipBudget = 185 * 1024;
 const forbidden = [
   /require\((["'])node:(?:fs|path|crypto|os|worker_threads|child_process)\1\)/,
   /require\((["'])(?:fs|path|crypto|os|worker_threads|child_process)\1\)/,
@@ -30,4 +32,3 @@ console.log(JSON.stringify({
   raw_budget: rawBudget,
   gzip_budget: gzipBudget,
 }));
-

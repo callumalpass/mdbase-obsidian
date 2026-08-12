@@ -34,7 +34,9 @@ const context = await esbuild.context({
     ...builtins,
   ],
   format: "cjs",
-  target: "es2018",
+  // Obsidian 1.11.4 ships on modern Electron/WebView runtimes. Keeping native
+  // ES2022 syntax avoids several kilobytes of compatibility transforms on mobile.
+  target: "es2022",
   logLevel: "info",
   sourcemap: prod ? false : "inline",
   treeShaking: true,
