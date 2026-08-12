@@ -15,7 +15,6 @@ import {
   type MdbaseConfig,
   type MdbaseFieldDef,
   type MdbaseTypeDef,
-  type V03CollectionSemantics,
 } from "./mdbaseCore";
 
 type Dict = Record<string, unknown>;
@@ -504,6 +503,8 @@ function configForMatching(raw: Dict, version: string): MdbaseConfig {
       include_subfolders: settings.include_subfolders !== false,
       exclude: Array.isArray(settings.exclude)
         ? settings.exclude.filter((value): value is string => typeof value === "string")
+        // This is collection configuration data, not Obsidian's runtime config path.
+        // eslint-disable-next-line obsidianmd/hardcoded-config-path -- Preserve the v0.2 collection-format default during migration.
         : ["_types", ".obsidian", ".git", ".mdbase"],
     },
   };
@@ -512,12 +513,12 @@ function configForMatching(raw: Dict, version: string): MdbaseConfig {
 function sourceTypeDefinition(path: string, frontmatter: Dict): MdbaseTypeDef {
   const fields: Record<string, MdbaseFieldDef> = {};
   for (const [name, value] of Object.entries(isRecord(frontmatter.fields) ? frontmatter.fields : {})) {
-    if (isRecord(value)) fields[name] = clone(value) as MdbaseFieldDef;
+    if (isRecord(value)) fields[name] = clone(value);
   }
   return {
     name: typeof frontmatter.name === "string" ? frontmatter.name : path.split("/").pop()?.replace(/\.md$/, "") ?? "type",
     fields,
-    match: isRecord(frontmatter.match) ? clone(frontmatter.match) as MdbaseTypeDef["match"] : undefined,
+    match: isRecord(frontmatter.match) ? clone(frontmatter.match) : undefined,
     filePath: path,
     specProfile: "v0.2",
   };
@@ -529,9 +530,9 @@ function targetTypeDefinition(path: string, frontmatter: Dict): MdbaseTypeDef {
   return {
     name: typeof frontmatter.name === "string" ? frontmatter.name : path.split("/").pop()?.replace(/\.md$/, "") ?? "type",
     fields: fieldsFromV03Schema(schema),
-    match: isRecord(frontmatter.match) ? clone(frontmatter.match) as MdbaseTypeDef["match"] : undefined,
+    match: isRecord(frontmatter.match) ? clone(frontmatter.match) : undefined,
     collection: isRecord(frontmatter.collection)
-      ? clone(frontmatter.collection) as V03CollectionSemantics
+      ? clone(frontmatter.collection)
       : undefined,
     schema: clone(schema),
     filePath: path,
@@ -681,7 +682,7 @@ export async function analyzeV02Migration(vault: Vault): Promise<V02MigrationPla
     }
     recordsVerified += 1;
     if (index > 0 && index % 250 === 0) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
     }
   }
 

@@ -435,7 +435,7 @@ export class MdbaseWorkspaceView extends ItemView {
       await this.reviewSyncChanges();
       const refreshedPreview = this.mirrorPreview as MdbaseSyncPreview | null;
       if (refreshedPreview?.plan.actions.length) {
-        new Notice("The current transfer review is open. Run Sync now again or confirm it in the mdbase view.");
+        new Notice("The current transfer review is open. Run sync now again or confirm it in the mdbase view.");
       }
       return;
     }
@@ -496,7 +496,8 @@ export class MdbaseWorkspaceView extends ItemView {
   }
 
   private captureRenderSnapshot(root: HTMLElement): RenderSnapshot {
-    const active = root.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
+    const activeDocument = root.ownerDocument;
+    const active = root.contains(activeDocument.activeElement) ? activeDocument.activeElement as HTMLElement : null;
     const editable = active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement ? active : null;
     const scroll = new Map<string, { top: number; left: number }>();
     for (const element of Array.from(root.querySelectorAll<HTMLElement>("[data-scroll-key]"))) {
@@ -746,8 +747,9 @@ export class MdbaseWorkspaceView extends ItemView {
 
     const headerActions = header.createDiv({ cls: "mdbase-editor-actions" });
     if (this.selectedPath) {
+      const selectedPath = this.selectedPath;
       const source = headerActions.createEl("button", { text: "Open source" });
-      source.onclick = () => void this.host.openFileByPath(this.selectedPath!);
+      source.onclick = () => void this.host.openFileByPath(selectedPath);
     }
     const save = headerActions.createEl("button", { text: "Save" });
     save.addClass("mod-cta");
@@ -1256,7 +1258,11 @@ export class MdbaseWorkspaceView extends ItemView {
     }
     const input = container.createEl("input", { type: type === "number" || type === "integer" ? "number" : "text" });
     input.setAttr("aria-label", label);
-    input.value = value === undefined || value === null ? "" : String(value);
+    input.value = value === undefined || value === null
+      ? ""
+      : typeof value === "string"
+        ? value
+        : typeof value === "number" || typeof value === "boolean" ? String(value) : "";
     input.disabled = readOnly;
     input.oninput = () => onChange(type === "number" || type === "integer" ? Number(input.value) : input.value);
   }
@@ -2671,13 +2677,14 @@ export class MdbaseWorkspaceView extends ItemView {
       const confirmed = await new TypeChangeConfirmationModal(this.app).confirm(highImpact);
       if (!confirmed) return;
     }
+    const model = this.model;
     await this.perform(async () => {
       const previousPath = this.selectedPath;
-      const file = await this.host.saveTypeModel(this.model!, previousPath, this.originalModel?.sourceRevision);
+      const file = await this.host.saveTypeModel(model, previousPath, this.originalModel?.sourceRevision);
       await this.host.clearTypeDraft(previousPath);
       if (previousPath !== file.path) await this.host.clearTypeDraft(file.path);
       this.selectedPath = file.path;
-      this.originalModel = clone(this.model!);
+      this.originalModel = clone(model);
       this.dirty = false;
       this.transientMessage = `Saved ${file.path}.`;
       await this.refresh(true);

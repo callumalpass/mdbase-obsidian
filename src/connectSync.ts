@@ -164,8 +164,8 @@ const ACCESS_SECRET_PREFIX = "mdbase-connect-access-";
 const REFRESH_SECRET_PREFIX = "mdbase-connect-refresh-";
 const ADOPTION_SECRET_PREFIX = "mdbase-connect-adoption-";
 const TOKEN_RENEWAL_WINDOW_MS = 5 * 60 * 1_000;
-const RESERVED_WRITE_PREFIXES = [".git/", ".obsidian/", ".trash/", ".mdbase/"];
-const RESERVED_BINARY_COMPONENTS = new Set([".git", ".mdbase", ".obsidian", ".trash", "node_modules", "_contracts", "_schemas", "_types", "_views"]);
+const RESERVED_WRITE_FOLDERS = [".git", ".trash", ".mdbase"];
+const RESERVED_BINARY_COMPONENTS = new Set([".git", ".mdbase", ".trash", "node_modules", "_contracts", "_schemas", "_types", "_views"]);
 const FILE_CLASS_ORDER: FileMediaClass[] = ["image", "audio", "video", "pdf", "other"];
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -191,7 +191,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function normalizeSelectiveSync(input?: Partial<SelectiveSyncPolicy> | null): SelectiveSyncPolicy {
   const rawClasses = input?.file_classes ?? [];
-  if (rawClasses.some((value) => !FILE_CLASS_ORDER.includes(value as FileMediaClass)) || new Set(rawClasses).size !== rawClasses.length) {
+  if (rawClasses.some((value) => !FILE_CLASS_ORDER.includes(value)) || new Set(rawClasses).size !== rawClasses.length) {
     throw new SyncError("invalid_file_materialization", "Selected file media classes must be valid and unique.");
   }
   const classes = [...rawClasses].sort((left, right) => FILE_CLASS_ORDER.indexOf(left) - FILE_CLASS_ORDER.indexOf(right));
@@ -277,13 +277,6 @@ function mediaTypeForPath(path: string): string | undefined {
   } as Record<string, string>)[extension];
 }
 
-function formatByteCount(value: number): string {
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
-  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
-  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
 async function adoptionRequestBody(value: unknown, raw: boolean | undefined): Promise<string | ArrayBuffer | undefined> {
   if (value === undefined) return undefined;
   if (!raw) return JSON.stringify(value);
@@ -324,9 +317,9 @@ function retryAfterMilliseconds(headers: Record<string, string>): number | undef
  */
 export async function resilientRequestUrl(
   request: RequestUrlParam,
-  primary: (request: RequestUrlParam | string) => Promise<RequestUrlResponse> = requestUrl,
-  fallback: typeof fetch = fetch,
-  desktop: typeof fetch | null = privilegedDesktopFetch(),
+  primary: (request: RequestUrlParam | string) => Promise<RequestUrlResponse> = (input) => requestUrl(input),
+  fallback: typeof window.fetch = (input, init) => window.fetch(input, init),
+  desktop: typeof window.fetch | null = privilegedDesktopFetch(),
 ): Promise<RequestUrlResponse> {
   if (desktop) {
     try {
@@ -346,11 +339,12 @@ export async function resilientRequestUrl(
   }
 }
 
-function privilegedDesktopFetch(): typeof fetch | null {
+function privilegedDesktopFetch(): typeof window.fetch | null {
   try {
     if (typeof require !== "function") return null;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- Electron is desktop-only and a static import breaks Obsidian mobile.
     const remoteNet = (require("electron") as {
-      remote?: { net?: { fetch?: typeof fetch } };
+      remote?: { net?: { fetch?: typeof window.fetch } };
     }).remote?.net;
     return remoteNet?.fetch ? remoteNet.fetch.bind(remoteNet) : null;
   } catch {
@@ -360,7 +354,7 @@ function privilegedDesktopFetch(): typeof fetch | null {
 
 async function fetchRequestUrl(
   request: RequestUrlParam,
-  send: typeof fetch,
+  send: typeof window.fetch,
 ): Promise<RequestUrlResponse> {
   const headers = new Headers(request.headers);
   if (request.contentType && !headers.has("content-type")) headers.set("content-type", request.contentType);
@@ -793,9 +787,15 @@ function headerValue(headers: Record<string, string>, name: string): string | un
   return match?.[1];
 }
 
-function safeMirrorPath(input: string): string {
+function reservedWriteFolders(vault: Vault): string[] {
+  // eslint-disable-next-line obsidianmd/hardcoded-config-path -- Lightweight test/adapter Vault implementations predate Vault.configDir.
+  const configDir = vault.configDir || ".obsidian";
+  return [configDir, ...RESERVED_WRITE_FOLDERS].map((folder) => normalizePath(folder).replace(/\/+$/, ""));
+}
+
+function safeMirrorPath(vault: Vault, input: string): string {
   const path = normalizeSafeRelativePath(input);
-  if (path === ".mdbase" || RESERVED_WRITE_PREFIXES.some((prefix) => path.startsWith(prefix))) {
+  if (reservedWriteFolders(vault).some((folder) => path === folder || path.startsWith(`${folder}/`))) {
     throw new SyncError("unsafe_mirror_path", `The collection authority attempted to write a reserved path: ${path}`);
   }
   return path;
@@ -803,6 +803,10 @@ function safeMirrorPath(input: string): string {
 
 function abortIfNeeded(signal?: AbortSignal): void {
   if (signal?.aborted) throw new DOMException("Synchronization cancelled.", "AbortError");
+}
+
+function indexedDbError(error: DOMException | null, operation: string): Error {
+  return error ?? new Error(`IndexedDB ${operation} failed without an error detail.`);
 }
 
 function abortableSyncTransport(
@@ -822,16 +826,19 @@ function abortableSyncTransport(
     }
     abortIfNeeded(signal);
   };
+  const uploadFile = transport.uploadFile?.bind(transport);
+  const moveFile = transport.moveFile?.bind(transport);
+  const deleteFile = transport.deleteFile?.bind(transport);
   return {
     openSession: () => run(() => transport.openSession()),
     snapshot: (snapshotId, page) => run(() => transport.snapshot(snapshotId, page)),
     fileSnapshot: (snapshotId, page) => run(() => transport.fileSnapshot(snapshotId, page)),
     downloadFile: (file) => stream(transport.downloadFile(file)),
-    ...(transport.uploadFile ? {
-      uploadFile: (request, source) => run(() => transport.uploadFile!(request, stream(source))),
+    ...(uploadFile ? {
+      uploadFile: (request, source) => run(() => uploadFile(request, stream(source))),
     } : {}),
-    ...(transport.moveFile ? { moveFile: (request) => run(() => transport.moveFile!(request)) } : {}),
-    ...(transport.deleteFile ? { deleteFile: (request) => run(() => transport.deleteFile!(request)) } : {}),
+    ...(moveFile ? { moveFile: (request) => run(() => moveFile(request)) } : {}),
+    ...(deleteFile ? { deleteFile: (request) => run(() => deleteFile(request)) } : {}),
     changes: (after, limit) => run(() => transport.changes(after, limit)),
     mutate: (mutation) => run(() => transport.mutate(mutation)),
   };
@@ -852,15 +859,19 @@ async function ensureFolder(vault: Vault, path: string): Promise<void> {
 }
 
 export class ObsidianMirrorFileSystem implements MirrorFileSystem {
-  constructor(private readonly vault: Vault) {}
+  constructor(
+    private readonly vault: Vault,
+    // eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file -- Tests and standalone adapters lack an App; production injects FileManager.trashFile below.
+    private readonly trashFile: (file: TFile) => Promise<void> = (file) => vault.delete(file, true),
+  ) {}
 
   async exists(input: string): Promise<boolean> {
-    const path = safeMirrorPath(input);
+    const path = safeMirrorPath(this.vault, input);
     return this.vault.getAbstractFileByPath(path) !== null || await this.vault.adapter.exists(path);
   }
 
   async read(input: string): Promise<string | null> {
-    const path = safeMirrorPath(input);
+    const path = safeMirrorPath(this.vault, input);
     const file = this.vault.getAbstractFileByPath(path);
     if (file == null) return null;
     if (!(file instanceof TFile)) {
@@ -870,7 +881,7 @@ export class ObsidianMirrorFileSystem implements MirrorFileSystem {
   }
 
   async write(input: string, value: string): Promise<void> {
-    const path = safeMirrorPath(input);
+    const path = safeMirrorPath(this.vault, input);
     const slash = path.lastIndexOf("/");
     if (slash >= 0) await ensureFolder(this.vault, path.slice(0, slash));
     const existing = this.vault.getAbstractFileByPath(path);
@@ -885,8 +896,8 @@ export class ObsidianMirrorFileSystem implements MirrorFileSystem {
   }
 
   async move(sourceInput: string, targetInput: string): Promise<void> {
-    const source = safeMirrorPath(sourceInput);
-    const target = safeMirrorPath(targetInput);
+    const source = safeMirrorPath(this.vault, sourceInput);
+    const target = safeMirrorPath(this.vault, targetInput);
     const file = this.vault.getAbstractFileByPath(source);
     if (!(file instanceof TFile)) {
       throw new SyncError("mirror_path_collision", `Expected a file at ${source}.`);
@@ -900,13 +911,13 @@ export class ObsidianMirrorFileSystem implements MirrorFileSystem {
   }
 
   async remove(input: string): Promise<void> {
-    const path = safeMirrorPath(input);
+    const path = safeMirrorPath(this.vault, input);
     const existing = this.vault.getAbstractFileByPath(path);
     if (existing == null) return;
     if (!(existing instanceof TFile)) {
       throw new SyncError("mirror_path_collision", `Expected a file at ${path}.`);
     }
-    await this.vault.delete(existing, true);
+    await this.trashFile(existing);
   }
 
   async listMarkdown(excluded: ReadonlySet<string>): Promise<string[]> {
@@ -914,7 +925,8 @@ export class ObsidianMirrorFileSystem implements MirrorFileSystem {
       .getMarkdownFiles()
       .map((file) => normalizePath(file.path))
       .filter((path) => !excluded.has(path))
-      .filter((path) => !RESERVED_WRITE_PREFIXES.some((prefix) => path.startsWith(prefix)))
+      .filter((path) => !reservedWriteFolders(this.vault)
+        .some((folder) => path === folder || path.startsWith(`${folder}/`)))
       .sort();
   }
 
@@ -1035,16 +1047,18 @@ export class IndexedDbMirrorBlobStore implements MirrorBlobStore {
         result.push([cursor.key, cursor.value as BlobManifest]);
         cursor.continue();
       };
-      request.onerror = () => reject(request.error);
+      request.onerror = () => reject(indexedDbError(request.error, "manifest cursor"));
     });
     const retainedStages = new Set<string>();
     for (const [key, manifest] of manifests) {
-      if (!Array.isArray(key) || key[0] !== this.namespace || retained.has(key[1] as `sha256:${string}`)) continue;
+      if (!Array.isArray(key) || key[0] !== this.namespace
+        || (typeof key[1] === "string" && retained.has(key[1] as `sha256:${string}`))) continue;
       await this.delete(BLOB_MANIFEST_STORE, key);
       await this.removeStage(manifest.stage, manifest.chunks);
     }
     for (const [key, manifest] of manifests) {
-      if (Array.isArray(key) && key[0] === this.namespace && retained.has(key[1] as `sha256:${string}`)) {
+      if (Array.isArray(key) && key[0] === this.namespace
+        && typeof key[1] === "string" && retained.has(key[1] as `sha256:${string}`)) {
         retainedStages.add(manifest.stage);
       }
     }
@@ -1055,10 +1069,13 @@ export class IndexedDbMirrorBlobStore implements MirrorBlobStore {
         const cursor = request.result;
         if (!cursor) return resolve(result);
         const key = cursor.key;
-        if (Array.isArray(key) && key[0] === this.namespace && !retainedStages.has(String(key[1]))) result.push(key);
+        const stage = Array.isArray(key) && typeof key[1] === "string" ? key[1] : null;
+        if (Array.isArray(key) && key[0] === this.namespace && (stage === null || !retainedStages.has(stage))) {
+          result.push(key);
+        }
         cursor.continue();
       };
-      request.onerror = () => reject(request.error);
+      request.onerror = () => reject(indexedDbError(request.error, "chunk cursor"));
     });
     for (const key of orphanKeys) await this.delete(BLOB_CHUNK_STORE, key);
   }
@@ -1084,7 +1101,7 @@ export class IndexedDbMirrorBlobStore implements MirrorBlobStore {
     return new Promise((resolve, reject) => {
       const request = database.transaction(storeName, "readonly").objectStore(storeName).get(key);
       request.onsuccess = () => resolve((request.result as Value | undefined) ?? null);
-      request.onerror = () => reject(request.error);
+      request.onerror = () => reject(indexedDbError(request.error, `read from ${storeName}`));
     });
   }
 
@@ -1094,8 +1111,8 @@ export class IndexedDbMirrorBlobStore implements MirrorBlobStore {
       const transaction = database.transaction(storeName, "readwrite");
       transaction.objectStore(storeName).put(value, key);
       transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error);
-      transaction.onabort = () => reject(transaction.error);
+      transaction.onerror = () => reject(indexedDbError(transaction.error, `write to ${storeName}`));
+      transaction.onabort = () => reject(indexedDbError(transaction.error, `write to ${storeName}`));
     });
   }
 
@@ -1105,8 +1122,8 @@ export class IndexedDbMirrorBlobStore implements MirrorBlobStore {
       const transaction = database.transaction(storeName, "readwrite");
       transaction.objectStore(storeName).delete(key);
       transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error);
-      transaction.onabort = () => reject(transaction.error);
+      transaction.onerror = () => reject(indexedDbError(transaction.error, `delete from ${storeName}`));
+      transaction.onabort = () => reject(indexedDbError(transaction.error, `delete from ${storeName}`));
     });
   }
 
@@ -1118,7 +1135,7 @@ export class IndexedDbMirrorBlobStore implements MirrorBlobStore {
         if (!request.result.objectStoreNames.contains(BLOB_MANIFEST_STORE)) request.result.createObjectStore(BLOB_MANIFEST_STORE);
         if (!request.result.objectStoreNames.contains(BLOB_CHUNK_STORE)) request.result.createObjectStore(BLOB_CHUNK_STORE);
       };
-      request.onerror = () => reject(request.error);
+      request.onerror = () => reject(indexedDbError(request.error, "binary store open"));
       request.onsuccess = () => resolve(request.result);
     });
     return this.database;
@@ -1135,7 +1152,7 @@ export class IndexedDbMirrorStateStore implements MirrorStateStore {
     return new Promise((resolve, reject) => {
       const request = database.transaction(STATE_STORE, "readonly").objectStore(STATE_STORE).get(this.key);
       request.onsuccess = () => resolve((request.result as MirrorState | undefined) ?? null);
-      request.onerror = () => reject(request.error);
+      request.onerror = () => reject(indexedDbError(request.error, "mirror state read"));
     });
   }
 
@@ -1145,8 +1162,8 @@ export class IndexedDbMirrorStateStore implements MirrorStateStore {
       const transaction = database.transaction(STATE_STORE, "readwrite");
       transaction.objectStore(STATE_STORE).put(state, this.key);
       transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error);
-      transaction.onabort = () => reject(transaction.error);
+      transaction.onerror = () => reject(indexedDbError(transaction.error, "mirror state write"));
+      transaction.onabort = () => reject(indexedDbError(transaction.error, "mirror state write"));
     });
   }
 
@@ -1156,8 +1173,8 @@ export class IndexedDbMirrorStateStore implements MirrorStateStore {
       const transaction = database.transaction(STATE_STORE, "readwrite");
       transaction.objectStore(STATE_STORE).delete(this.key);
       transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error);
-      transaction.onabort = () => reject(transaction.error);
+      transaction.onerror = () => reject(indexedDbError(transaction.error, "mirror state clear"));
+      transaction.onabort = () => reject(indexedDbError(transaction.error, "mirror state clear"));
     });
   }
 
@@ -1172,7 +1189,7 @@ export class IndexedDbMirrorStateStore implements MirrorStateStore {
           request.result.createObjectStore(STATE_STORE);
         }
       };
-      request.onerror = () => reject(request.error);
+      request.onerror = () => reject(indexedDbError(request.error, "mirror state store open"));
       request.onsuccess = () => resolve(request.result);
     });
     return this.database;
@@ -1227,7 +1244,10 @@ export class ConnectSyncController {
     private readonly settingsHost: ConnectSyncSettingsHost,
     private readonly options: ConnectSyncControllerOptions = {},
   ) {
-    this.fileSystem = options.fileSystem ?? new ObsidianMirrorFileSystem(app.vault);
+    this.fileSystem = options.fileSystem ?? new ObsidianMirrorFileSystem(
+      app.vault,
+      (file) => app.fileManager.trashFile(file),
+    );
     this.enrollmentClient = options.enrollmentClient ?? new MirrorEnrollmentClient({
       request: createObsidianEnrollmentRequester(),
     });
@@ -1334,7 +1354,7 @@ export class ConnectSyncController {
     }
     return this.runAdoptionWithRecovery(session, {
       ...callbacks,
-      onVerification: callbacks.onVerification ?? (() => undefined),
+      onVerification: (verification) => callbacks.onVerification?.(verification),
     });
   }
 
@@ -1437,7 +1457,9 @@ export class ConnectSyncController {
       accessTokenExpiresAt: profile.accessTokenExpiresAt,
     });
     await this.persistEnrollment(renewed, profile.selectiveSync);
-    return (await this.status())!;
+    const status = await this.status();
+    if (!status) throw new SyncError("mirror_not_configured", "The renewed mirror profile could not be loaded.");
+    return status;
   }
 
   async reauthorize(callbacks: EnrollMirrorCallbacks): Promise<MirrorStatus> {
@@ -1470,7 +1492,9 @@ export class ConnectSyncController {
     if (enrollment.replicaId !== profile.replicaId && "clear" in oldStore && typeof oldStore.clear === "function") {
       await oldStore.clear();
     }
-    return (await this.status())!;
+    const status = await this.status();
+    if (!status) throw new SyncError("mirror_not_configured", "The reauthorized mirror profile could not be loaded.");
+    return status;
   }
 
   async conflictComparison(
@@ -1558,7 +1582,7 @@ export class ConnectSyncController {
   }
 
   async preserveConflictCopy(pathInput: string): Promise<string> {
-    const path = safeMirrorPath(pathInput);
+    const path = safeMirrorPath(this.app.vault, pathInput);
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (!(existing instanceof TFile)) throw new SyncError("mirror_conflict_copy_missing", `No local file exists at ${path}.`);
     const extension = existing.extension ? `.${existing.extension}` : "";
@@ -1788,7 +1812,7 @@ export class ConnectSyncController {
         mode: "read_write",
       }, {
         signal: callbacks.signal,
-        onVerification: callbacks.onVerification,
+        onVerification: (verification) => callbacks.onVerification(verification),
       });
     }
     const markerCreated = await this.markMirror(enrollment.collectionId);
@@ -2413,7 +2437,7 @@ function validAdoptionMarker(value: unknown): value is AdoptionMarker {
 function validSelectiveSync(value: unknown): value is SelectiveSyncPolicy {
   if (!isRecord(value) || !Array.isArray(value.file_classes) || !Array.isArray(value.excluded_folders)) return false;
   try {
-    const normalized = normalizeSelectiveSync(value as unknown as SelectiveSyncPolicy);
+    const normalized = normalizeSelectiveSync(value);
     return normalized.file_classes.length === value.file_classes.length
       && normalized.excluded_folders.length === value.excluded_folders.length;
   } catch {

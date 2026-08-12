@@ -2,7 +2,6 @@ import type { CollectionContractDescriptor, JsonObject } from "@mdbase-dev/conne
 import { schemaFromV03Fields } from "./mdbaseCore";
 import type {
   TypeEditorContractImplementation,
-  TypeEditorField,
   TypeEditorModel,
 } from "./typeEditorTypes";
 
@@ -178,4 +177,3 @@ function compatibleTypes(contractType: string, typeType: string): boolean {
   if (contractType === typeType) return true;
   return contractType === "number" && typeType === "integer";
 }
-

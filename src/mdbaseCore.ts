@@ -120,6 +120,8 @@ const DEFAULT_CONFIG: MdbaseConfig = {
     explicit_type_keys: ["type", "types"],
     default_strict: false,
     include_subfolders: true,
+    // This is the portable collection default, not the active Obsidian config path.
+    // eslint-disable-next-line obsidianmd/hardcoded-config-path -- Keep generated mdbase.yaml compatible with existing collections.
     exclude: ["_types", ".obsidian", ".git", "node_modules", ".trash", ".mdbase"],
   },
 };
@@ -667,7 +669,7 @@ export async function loadTypeDefinitions(vault: Vault, config: MdbaseConfig): P
         display_name_key: collection?.display?.name_field,
         path_pattern: collection?.path?.pattern,
         strict: schema.additionalProperties === false,
-        match: isRecord(fm.match) ? (fm.match as MdbaseTypeDef["match"]) : undefined,
+        match: isRecord(fm.match) ? (fm.match) : undefined,
         fields,
         filePath: file.path,
         specProfile: "v0.3",
@@ -684,7 +686,7 @@ export async function loadTypeDefinitions(vault: Vault, config: MdbaseConfig): P
 
     for (const [fieldName, value] of Object.entries(fm.fields)) {
       if (isRecord(value)) {
-        fields[fieldName] = value as MdbaseFieldDef;
+        fields[fieldName] = value;
       }
     }
 
@@ -695,7 +697,7 @@ export async function loadTypeDefinitions(vault: Vault, config: MdbaseConfig): P
       path_pattern: typeof fm.path_pattern === "string" ? fm.path_pattern : undefined,
       filename_pattern: typeof fm.filename_pattern === "string" ? fm.filename_pattern : undefined,
       strict: parseStrictMode(fm.strict),
-      match: isRecord(fm.match) ? (fm.match as MdbaseTypeDef["match"]) : undefined,
+      match: isRecord(fm.match) ? (fm.match) : undefined,
       fields,
       filePath: file.path,
       specProfile: "v0.2",
@@ -771,8 +773,15 @@ function applyPathTemplate(template: string, frontmatter: Record<string, unknown
   return template.replace(/\{([^}]+)\}/g, (_match, key: string) => {
     const value = frontmatter[key];
     if (value == null) return "";
-    if (Array.isArray(value)) return value.join("-");
-    return String(value);
+    if (Array.isArray(value)) {
+      return value
+        .filter((entry): entry is string | number | boolean => ["string", "number", "boolean"].includes(typeof entry))
+        .map(String)
+        .join("-");
+    }
+    return typeof value === "string"
+      ? value
+      : typeof value === "number" || typeof value === "boolean" ? String(value) : "";
   });
 }
 
@@ -789,7 +798,7 @@ export function normalizeSafeRelativePath(input: string): string {
 }
 
 function extractBaseFolderFromGlob(globPattern: string): string {
-  const wildcardIndex = globPattern.search(/[\*\?\[]/);
+  const wildcardIndex = globPattern.search(/[*?]|\[/);
   const prefix = wildcardIndex === -1 ? globPattern : globPattern.slice(0, wildcardIndex);
   const folder = prefix.replace(/\/+$/, "");
   if (folder.endsWith(".md")) {
@@ -917,13 +926,16 @@ function matchesWhereOperator(
         && expected.some((entry) => equals(entry, selected.value));
     case "startsWith":
     case "starts_with":
-      return typeof selected.value === "string" && selected.value.startsWith(String(expected));
+      return typeof selected.value === "string" && typeof expected === "string"
+        && selected.value.startsWith(expected);
     case "endsWith":
     case "ends_with":
-      return typeof selected.value === "string" && selected.value.endsWith(String(expected));
+      return typeof selected.value === "string" && typeof expected === "string"
+        && selected.value.endsWith(expected);
     case "matches":
       try {
-        return selected.value != null && new RegExp(String(expected).replace(/\\\\/g, "\\")).test(String(selected.value));
+        return typeof selected.value === "string" && typeof expected === "string"
+          && new RegExp(expected.replace(/\\\\/g, "\\")).test(selected.value);
       } catch {
         return false;
       }

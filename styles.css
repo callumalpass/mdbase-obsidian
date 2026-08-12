@@ -1024,13 +1024,6 @@ details.mdbase-field-node {
   font-size: var(--font-ui-smaller);
 }
 
-.mdbase-conflict-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
 .mdbase-enrollment > button {
   margin-top: 12px;
 }
@@ -1424,6 +1417,7 @@ details.mdbase-field-node {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
+  gap: 16px;
 }
 
 .mdbase-conflict-summary { min-width: 0; }

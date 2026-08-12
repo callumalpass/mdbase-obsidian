@@ -98,7 +98,7 @@ function definitionForSelector(
   let available = fields;
   let current: MdbaseFieldDef | undefined;
   for (const [index, rawSegment] of segments.entries()) {
-    const match = rawSegment.match(/^([^\[\]]+)((?:\[\])*)$/);
+    const match = rawSegment.match(/^([^[]+)((?:\[\])*)$/);
     if (!match) return null;
     current = available[match[1]];
     if (!current) return null;
@@ -245,7 +245,7 @@ export function frontmatterFromTypeModel(model: TypeEditorModel): Record<string,
     const name = field.name.trim();
     if (!name) throw new Error("Every field needs a name.");
     if (Object.prototype.hasOwnProperty.call(fields, name)) throw new Error(`Duplicate field name: ${name}`);
-    fields[name] = clone(field.definition) as MdbaseFieldDef;
+    fields[name] = clone(field.definition);
   }
   const typeName = validateMdbaseTypeName(model.name);
   const frontmatter: Record<string, unknown> = {

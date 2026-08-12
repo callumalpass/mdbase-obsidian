@@ -290,11 +290,10 @@ class MdbaseSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "mdbase settings" });
 
     new Setting(containerEl)
       .setName("Validate on save")
-      .setDesc("Run mdbase validation when a markdown file is modified.")
+      .setDesc("Run mdbase validation when a Markdown file is modified.")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.validateOnSave).onChange(async (value) => {
           this.plugin.settings.validateOnSave = value;
@@ -601,8 +600,10 @@ export default class MdbasePlugin extends Plugin {
     }, 60_000));
   }
 
-  async onunload(): Promise<void> {
-    await this.interopBridge.dispose();
+  onunload(): void {
+    void this.interopBridge.dispose().catch((error: unknown) => {
+      console.error("mdbase: failed to dispose the interoperability bridge", error);
+    });
     this.app.workspace.getLeavesOfType(MDBASE_WORKSPACE_VIEW).forEach((leaf) => leaf.detach());
     this.saveValidations.clear();
     this.schemaRefreshes.clear();
@@ -760,7 +761,7 @@ export default class MdbasePlugin extends Plugin {
     const saved = await this.writeTypeDefinition(
       config,
       model,
-      existing as TFile | null,
+      existing,
       expectedSourceRevision,
     );
     this.refreshWorkspaceViews(true);
@@ -936,7 +937,7 @@ export default class MdbasePlugin extends Plugin {
   async openWorkspace(destination: "types" | "sync" | "issues" = "types"): Promise<MdbaseWorkspaceView> {
     const existing = this.app.workspace.getLeavesOfType(MDBASE_WORKSPACE_VIEW)[0];
     if (existing) {
-      this.app.workspace.revealLeaf(existing);
+      await this.app.workspace.revealLeaf(existing);
       const view = existing.view as MdbaseWorkspaceView;
       view.showDestination(destination);
       await view.refresh();
@@ -944,7 +945,7 @@ export default class MdbasePlugin extends Plugin {
     }
     const leaf = this.app.workspace.getLeaf(true);
     await leaf.setViewState({ type: MDBASE_WORKSPACE_VIEW, active: true });
-    this.app.workspace.revealLeaf(leaf);
+    await this.app.workspace.revealLeaf(leaf);
     const view = leaf.view as MdbaseWorkspaceView;
     await view.refresh();
     view.showDestination(destination);
@@ -1129,7 +1130,8 @@ export default class MdbasePlugin extends Plugin {
   private observeLocalMirrorChange(path: string): void {
     if (!this.getMirrorProfile() || this.connectSync.isSyncing()) return;
     const normalized = normalizePath(path);
-    if ([".obsidian", ".mdbase", ".trash", ".git"].some((folder) => normalized === folder || normalized.startsWith(`${folder}/`))) return;
+    const reservedFolders = [this.app.vault.configDir, ".mdbase", ".trash", ".git"];
+    if (reservedFolders.some((folder) => normalized === folder || normalized.startsWith(`${folder}/`))) return;
     this.localChangeObserved = true;
     this.updateStatusBar();
   }
@@ -1321,7 +1323,7 @@ export default class MdbasePlugin extends Plugin {
   private async validateCurrentNoteCommand(): Promise<void> {
     const activeFile = this.app.workspace.getActiveFile();
     if (!(activeFile instanceof TFile) || activeFile.extension !== "md") {
-      new Notice("Open a markdown note first.");
+      new Notice("Open a Markdown note first.");
       return;
     }
 

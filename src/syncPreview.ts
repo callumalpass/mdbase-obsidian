@@ -60,8 +60,9 @@ export function previewFromPlan(plan: MirrorSyncPlan): MdbaseSyncPreview {
       && ("target" in action ? action.target.entity === "file" : "source" in action && action.source.entity === "file")).length,
     unchanged_files: 0,
     collisions: plan.issues
-      .filter((issue) => issue.blocking && issue.code === "local_collision" && issue.path)
-      .map((issue) => issue.path!),
+      .filter((issue): issue is typeof issue & { path: string } =>
+        issue.blocking && issue.code === "local_collision" && issue.path !== undefined)
+      .map((issue) => issue.path),
     local_issues: plan.issues
       .filter((issue): issue is typeof issue & { path: string } =>
         issue.code === "invalid_frontmatter" && issue.path !== undefined)

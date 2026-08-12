@@ -87,11 +87,12 @@ export class KeyedTrailingDebouncer<Key, Value> {
       await this.task(value, isCurrent);
     } finally {
       entry.running = false;
-      if (this.entries.get(key) !== entry) return;
-      if (entry.ready) {
-        void this.drain(key, entry);
-      } else if (entry.timer === null && entry.revision === revision) {
-        this.entries.delete(key);
+      if (this.entries.get(key) === entry) {
+        if (entry.ready) {
+          void this.drain(key, entry);
+        } else if (entry.timer === null && entry.revision === revision) {
+          this.entries.delete(key);
+        }
       }
     }
   }
