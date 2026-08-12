@@ -68,6 +68,37 @@ test("HTTP adapter falls back to fetch only when Obsidian's native bridge fails"
   assert.equal(fetchCalls, 0);
 });
 
+test("HTTP adapter prefers the privileged desktop network stack", async () => {
+  let nativeCalls = 0;
+  let browserCalls = 0;
+  let desktopCalls = 0;
+  const result = await resilientRequestUrl({
+    url: "https://connect.example/v1/authorities/11111111-1111-4111-8111-111111111111/sync/sessions",
+    method: "POST",
+    headers: { authorization: "Bearer device-secret" },
+    throw: false,
+  }, async () => {
+    nativeCalls += 1;
+    return response(403, { error: { code: "origin_denied" } }) as never;
+  }, async () => {
+    browserCalls += 1;
+    return new Response();
+  }, async (_input, init) => {
+    desktopCalls += 1;
+    assert.equal(new Headers(init?.headers).get("authorization"), "Bearer device-secret");
+    return new Response(JSON.stringify({ protocol_version: 1 }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  });
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.json, { protocol_version: 1 });
+  assert.equal(desktopCalls, 1);
+  assert.equal(nativeCalls, 0);
+  assert.equal(browserCalls, 0);
+});
+
 test("Obsidian HTTP transport downloads bounded binary parts and cleans up the transfer", async () => {
   const bytes = Uint8Array.of(0, 1, 2, 3, 254, 255);
   const file = descriptor("Media/download.png", bytes);

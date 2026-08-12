@@ -292,56 +292,83 @@ function retryAfterMilliseconds(headers: Record<string, string>): number | undef
 }
 
 /**
- * Obsidian's native request bridge occasionally fails before producing an HTTP
- * response (observed as net::ERR_FAILED in desktop 1.13.7). The web fetch path
- * is a safe fallback for Connect and prepared object-storage URLs and keeps the
- * same response shape used by the rest of this adapter.
+ * Obsidian desktop 1.13.7 can either fail its request bridge with
+ * net::ERR_FAILED or attach a browser Origin that correctly invalidates mirror
+ * credentials. Electron's main-process network stack is the privileged desktop
+ * transport; requestUrl remains the mobile transport and web fetch is its
+ * last-resort fallback.
  */
 export async function resilientRequestUrl(
   request: RequestUrlParam,
   primary: (request: RequestUrlParam | string) => Promise<RequestUrlResponse> = requestUrl,
   fallback: typeof fetch = fetch,
+  desktop: typeof fetch | null = privilegedDesktopFetch(),
 ): Promise<RequestUrlResponse> {
+  if (desktop) {
+    try {
+      return await fetchRequestUrl(request, desktop);
+    } catch {
+      // Continue through Obsidian's cross-platform bridge below.
+    }
+  }
   try {
     return await primary(request);
   } catch (primaryError) {
-    let response: Response;
     try {
-      const headers = new Headers(request.headers);
-      if (request.contentType && !headers.has("content-type")) headers.set("content-type", request.contentType);
-      response = await fallback(request.url, {
-        method: request.method,
-        headers,
-        body: request.body,
-      });
+      return await fetchRequestUrl(request, fallback);
     } catch {
       throw primaryError;
     }
-    const arrayBuffer = await response.arrayBuffer();
-    const text = new TextDecoder().decode(arrayBuffer);
-    let json: unknown = null;
-    if (text.trim()) {
-      try {
-        json = JSON.parse(text);
-      } catch {
-        json = null;
-      }
-    }
-    if (request.throw !== false && response.status >= 400) {
-      throw new Error(`Request failed with status ${response.status}`);
-    }
-    const responseHeaders: Record<string, string> = {};
-    response.headers.forEach((value, name) => {
-      responseHeaders[name] = value;
-    });
-    return {
-      status: response.status,
-      headers: responseHeaders,
-      arrayBuffer,
-      json,
-      text,
-    };
   }
+}
+
+function privilegedDesktopFetch(): typeof fetch | null {
+  try {
+    if (typeof require !== "function") return null;
+    const remoteNet = (require("electron") as {
+      remote?: { net?: { fetch?: typeof fetch } };
+    }).remote?.net;
+    return remoteNet?.fetch ? remoteNet.fetch.bind(remoteNet) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchRequestUrl(
+  request: RequestUrlParam,
+  send: typeof fetch,
+): Promise<RequestUrlResponse> {
+  const headers = new Headers(request.headers);
+  if (request.contentType && !headers.has("content-type")) headers.set("content-type", request.contentType);
+  const response = await send(request.url, {
+    method: request.method,
+    headers,
+    body: request.body,
+  });
+  const arrayBuffer = await response.arrayBuffer();
+  const text = new TextDecoder().decode(arrayBuffer);
+  let json: unknown = null;
+  if (text.trim()) {
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = null;
+    }
+  }
+  if (request.throw !== false && response.status >= 400) {
+    throw new Error(`Request failed with status ${response.status}`);
+  }
+  const responseHeaders: Record<string, string> = {};
+  response.headers.forEach((value, name) => {
+    responseHeaders[name] = value;
+  });
+  return {
+    status: response.status,
+    headers: responseHeaders,
+    arrayBuffer,
+    json,
+    text,
+  };
 }
 
 export function createObsidianEnrollmentRequester(): MirrorEnrollmentRequester {
