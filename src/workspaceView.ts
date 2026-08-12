@@ -29,6 +29,7 @@ import type { V02MigrationPlan } from "./migration";
 import { MDBASE_ICON_ID } from "./mdbaseIcon";
 import type { StoredTypeDraft, TypeEditorField, TypeEditorModel } from "./typeEditorTypes";
 import type { MdbaseSyncPreview, SyncPreviewDirection } from "./syncPreview";
+import { resolveConflictAndRefresh } from "./syncConflict";
 import {
   createDefaultTypeModel,
   frontmatterFromTypeModel,
@@ -202,16 +203,6 @@ function syncStateLabel(status: MirrorStatus | null): string {
   if (status.state === "changes_waiting") return "Local changes waiting";
   if (status.state === "attention") return "Needs attention";
   return "Ready for first sync";
-}
-
-function syncPreviewSignature(preview: MdbaseSyncPreview): string {
-  return JSON.stringify({
-    phase: preview.phase,
-    cursor: preview.cursor,
-    remoteHead: preview.remoteHead,
-    collisions: preview.collisions,
-    entries: preview.entries.map((entry) => [entry.kind, entry.direction, entry.action, entry.path, entry.recordId ?? entry.fileId ?? ""]),
-  });
 }
 
 function isAbortError(error: unknown): boolean {
@@ -1542,34 +1533,41 @@ export class MdbaseWorkspaceView extends ItemView {
         : "This vault and the hosted collection are already aligned.";
       this.render();
     });
-    const transferCount = this.mirrorPreview
-      ? this.mirrorPreview.entries.filter((entry) => entry.direction !== "attention").length
-      : 0;
-    const hasBlockingCollision = (this.mirrorPreview?.collisions.length ?? 0) > 0;
+    const plannedOutcomeCount = this.mirrorPreview?.plan.actions
+      .filter((action) => action.command !== "advance_checkpoint").length ?? 0;
+    const hasCheckpointAction = this.mirrorPreview?.plan.actions
+      .some((action) => action.command === "advance_checkpoint") ?? false;
+    const hasBlockingIssue = (this.mirrorPreview?.plan.summary.blocking_issues ?? 0) > 0;
     const sync = actions.createEl("button", {
       text: this.mirrorPreview
-        ? transferCount
-          ? `Sync ${transferCount} ${transferCount === 1 ? "change" : "changes"}`
-          : "No changes to sync"
+        ? plannedOutcomeCount
+          ? `Sync ${plannedOutcomeCount} ${plannedOutcomeCount === 1 ? "outcome" : "outcomes"}`
+          : hasCheckpointAction
+            ? "Confirm sync checkpoint"
+            : "Already up to date"
         : "Review before syncing",
     });
     sync.addClass("mod-cta");
-    sync.disabled = this.busy || !this.mirrorPreview || transferCount === 0 || hasBlockingCollision;
+    sync.disabled = this.busy || !this.mirrorPreview || hasBlockingIssue
+      || this.mirrorPreview.plan.actions.length === 0;
     sync.onclick = () => void this.perform(async () => {
       try {
         const reviewed = this.mirrorPreview!;
-        const latest = await this.host.connectSync.preview();
-        if (syncPreviewSignature(latest) !== syncPreviewSignature(reviewed)) {
-          this.mirrorPreview = latest;
-          this.transientMessage = "The transfer plan changed since your review. Review the updated items before syncing.";
-          return;
-        }
-        this.mirrorStatus = await this.host.connectSync.sync((progress) => {
+        const outcome = await this.host.connectSync.sync(reviewed, (progress) => {
           this.mirrorProgress = progress;
           this.render();
         });
+        this.mirrorStatus = await this.host.connectSync.status();
         this.mirrorPreview = await this.host.connectSync.preview();
-        this.transientMessage = "Sync complete. The local checkpoint matches the hosted authority.";
+        this.transientMessage = outcome.status === "applied"
+          ? "Sync completed and the local checkpoint was verified."
+          : outcome.status === "attention"
+            ? "Sync checkpointed completed actions and recorded the items that need attention."
+            : outcome.status === "cancelled"
+              ? `Sync stopped safely after ${outcome.applied} actions; ${outcome.pending} remain pending.`
+              : outcome.status === "stale"
+                ? "The reviewed plan became stale. Review the new engine plan before syncing again."
+                : `Sync stopped at a durable action boundary: ${outcome.failure?.message ?? outcome.status}.`;
         await this.refresh(true);
       } catch (error) {
         if (!isAbortError(error)) throw error;
@@ -1583,7 +1581,6 @@ export class MdbaseWorkspaceView extends ItemView {
 
     if (this.mirrorPreview) this.renderMirrorPreview(document, this.mirrorPreview);
     if (this.mirrorStatus?.conflicts.length) this.renderConflicts(document, this.mirrorStatus);
-    if (this.mirrorStatus?.file_conflicts?.length) this.renderFileConflicts(document, this.mirrorStatus);
     if (this.mirrorStatus?.local_issues.length) {
       this.renderLocalMirrorIssues(document, this.mirrorStatus);
     }
@@ -1968,7 +1965,11 @@ export class MdbaseWorkspaceView extends ItemView {
     for (const conflict of status.conflicts) {
       const row = section.createDiv({ cls: "mdbase-conflict-row" });
       const text = row.createDiv();
-      text.createEl("strong", { text: conflict.path ?? conflict.record_id });
+      text.createEl("strong", { text: conflict.path ?? conflict.object_id });
+      text.createDiv({
+        text: conflict.entity === "file" ? "Binary file conflict" : "Note conflict",
+        cls: "mdbase-muted",
+      });
       text.createDiv({ text: conflict.message });
       const actions = row.createDiv({ cls: "mdbase-actions" });
       for (const resolution of ["local", "remote"] as const) {
@@ -1977,30 +1978,16 @@ export class MdbaseWorkspaceView extends ItemView {
         });
         button.disabled = this.busy;
         button.onclick = () => void this.perform(async () => {
-          this.mirrorStatus = await this.host.connectSync.resolveConflict(conflict.record_id, resolution);
-          this.render();
-        });
-      }
-    }
-  }
-
-  private renderFileConflicts(container: HTMLElement, status: MirrorStatus): void {
-    const section = container.createEl("section", { cls: "mdbase-editor-section" });
-    section.createEl("h3", { text: "File conflicts" });
-    section.createEl("p", { text: "Binary bytes are never merged. Choose which complete file should become authoritative." });
-    for (const conflict of status.file_conflicts) {
-      const row = section.createDiv({ cls: "mdbase-conflict-row" });
-      const text = row.createDiv();
-      text.createEl("strong", { text: conflict.path });
-      text.createDiv({ text: conflict.message });
-      const actions = row.createDiv({ cls: "mdbase-actions" });
-      for (const resolution of ["local", "remote"] as const) {
-        const button = actions.createEl("button", { text: resolution === "local" ? "Keep local file" : "Use hosted file" });
-        button.disabled = this.busy;
-        button.onclick = () => void this.perform(async () => {
-          this.mirrorStatus = await this.host.connectSync.resolveFileConflict(conflict.file_id, resolution);
           this.mirrorPreview = null;
-          this.transientMessage = "File conflict resolved. Review the updated transfer plan.";
+          const resolved = await resolveConflictAndRefresh(
+            this.host.connectSync,
+            conflict.object_id,
+            conflict.decision_id,
+            resolution,
+          );
+          this.mirrorStatus = resolved.status;
+          this.mirrorPreview = resolved.preview;
+          this.transientMessage = "Conflict resolved. Review the refreshed engine plan before syncing.";
         });
       }
     }

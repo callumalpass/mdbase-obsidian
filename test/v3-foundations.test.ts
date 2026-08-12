@@ -184,6 +184,26 @@ class MemoryVault {
     this.binaryFiles.delete(file.path);
   }
 
+  async rename(file: TFile, target: string): Promise<void> {
+    const normalized = normalizePath(target);
+    if (this.getAbstractFileByPath(normalized)) throw new Error(`exists ${normalized}`);
+    const text = this.files.get(file.path);
+    const binary = this.binaryFiles.get(file.path);
+    if (text) {
+      this.files.delete(file.path);
+      const renamed = new TestFile(normalized);
+      this.files.set(normalized, { file: renamed, content: text.content });
+      return;
+    }
+    if (binary) {
+      this.binaryFiles.delete(file.path);
+      const renamed = new TestFile(normalized);
+      this.binaryFiles.set(normalized, { file: renamed, content: binary.content });
+      return;
+    }
+    throw new Error(`missing ${file.path}`);
+  }
+
   read(path: string): string | null {
     return this.files.get(normalizePath(path))?.content ?? null;
   }
@@ -881,10 +901,16 @@ test("Obsidian binary adapter preserves exact bytes and excludes unsafe collecti
     size: bytes.byteLength,
     content_digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
   });
+  assert.equal(await adapter.exists("Attachments/exact.png"), true);
+  assert.equal(await adapter.exists("Attachments/missing.png"), false);
+  await adapter.move("Attachments/exact.png", "Archive/renamed.png");
+  assert.equal(await adapter.exists("Attachments/exact.png"), false);
+  assert.deepEqual(vault.readBytes("Archive/renamed.png"), bytes);
+  await assert.rejects(adapter.move("Archive/renamed.png", ".obsidian/unsafe.png"), /reserved|unsafe/i);
 
   await vault.createBinary(".obsidian/private.png", Uint8Array.of(1).buffer);
   await vault.createBinary("Attachments/ignored.md", Uint8Array.of(2).buffer);
-  assert.deepEqual(await adapter.listBinary(new Set()), ["Attachments/exact.png"]);
+  assert.deepEqual(await adapter.listBinary(new Set()), ["Archive/renamed.png"]);
   await assert.rejects(adapter.writeBinary("../escape.png", (async function* () { yield bytes; })()), /safe relative|invalid|path/i);
   await assert.rejects(adapter.writeBinary("CON.png", (async function* () { yield bytes; })()), /reserved|non-portable/i);
 });
@@ -1050,7 +1076,7 @@ test("Connect controller previews the exact first transfer and later local edits
   assert.deepEqual(first.entries.map((entry) => [entry.direction, entry.action, entry.path]), [
     ["download", "create", "notes/one.md"],
   ]);
-  await controller.sync();
+  await controller.sync(first);
   const local = vault.getAbstractFileByPath("notes/one.md") as TFile;
   await vault.modify(local, (vault.read(local.path) ?? "").replace("First", "Edited locally"));
   const incremental = await controller.preview();
@@ -1102,7 +1128,11 @@ test("writable mirror uploads local edits and collision preflight makes no write
     fileSystem: new ObsidianMirrorFileSystem(collisionVault as never),
     stateStore: collisionState,
   });
-  await assert.rejects(checkedMirror.sync(), /already exist|collis|differ/i);
+  const collision = await checkedMirror.sync();
+  assert.equal(collision.status, "attention");
+  assert.deepEqual(collision.issues.map((issue) => [issue.code, issue.path, issue.blocking]), [
+    ["local_collision", "notes/one.md", true],
+  ]);
   assert.equal(collisionVault.read("notes/one.md"), "unmanaged bytes");
   assert.equal(await collisionState.read(), null);
 });
@@ -1133,10 +1163,16 @@ test("interrupted mirror write does not advance the checkpoint and a retry conve
     fileSystem: new ObsidianMirrorFileSystem(vault as never),
     stateStore: state,
   });
-  await assert.rejects(mirror.sync(), /injected adapter create failure/);
-  assert.equal(await state.read(), null);
+  const interrupted = await mirror.sync();
+  assert.equal(interrupted.status, "failed", JSON.stringify(interrupted));
+  assert.match(interrupted.failure?.message ?? "", /injected adapter create failure/);
+  const recovery = await state.read();
+  assert.equal(recovery?.generation, 0);
+  assert.equal(recovery?.batch?.phase, "blocked");
+  assert.equal(recovery?.batch?.next_action, 1);
   vault.failCreatePath = null;
-  await mirror.sync();
+  const applied = await mirror.sync();
+  assert.equal(applied.status, "applied", JSON.stringify(applied));
   assert.equal((await mirror.status()).state, "up_to_date");
   assert.equal(vault.getMarkdownFiles().length, 2);
 });

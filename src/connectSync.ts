@@ -23,7 +23,6 @@ import type {
   OpenFileUploadRequest,
   PreparedFilePart,
   SelectiveSyncPolicy,
-  SyncChange,
   SyncChangesPage,
   SyncFileSnapshotPage,
   SyncMutation,
@@ -49,8 +48,8 @@ import {
 } from "@mdbase-dev/connect-sync/adoption";
 import {
   DirectoryMirror,
-  portableMirrorRuntime,
   type DirectoryMirrorOptions,
+  type MirrorApplyResult,
   type MirrorBinaryInfo,
   type MirrorBlobStore,
   type MirrorFileSystem,
@@ -76,13 +75,7 @@ import {
 } from "./mdbaseCore";
 import {
   type MdbaseSyncPreview,
-  type SyncPreviewEntry,
-  flagConcurrentFileChanges,
-  localChangeEntries,
-  localFileChangeEntries,
-  remoteChangeEntries,
-  remoteFileChangeEntries,
-  summarizePreview,
+  previewFromPlan,
 } from "./syncPreview";
 
 export interface MirrorProfile {
@@ -726,17 +719,6 @@ function abortableSyncTransport(
   };
 }
 
-function deduplicatePreviewEntries(entries: readonly SyncPreviewEntry[]): SyncPreviewEntry[] {
-  const result = new Map<string, SyncPreviewEntry>();
-  for (const entry of entries) {
-    const key = `${entry.kind}\u0000${entry.direction}\u0000${entry.path}\u0000${entry.action}`;
-    result.set(key, entry);
-  }
-  return [...result.values()].sort((left, right) =>
-    left.direction.localeCompare(right.direction) || left.path.localeCompare(right.path),
-  );
-}
-
 async function ensureFolder(vault: Vault, path: string): Promise<void> {
   const folder = normalizePath(path).replace(/\/+$/, "");
   if (!folder) return;
@@ -753,6 +735,11 @@ async function ensureFolder(vault: Vault, path: string): Promise<void> {
 
 export class ObsidianMirrorFileSystem implements MirrorFileSystem {
   constructor(private readonly vault: Vault) {}
+
+  async exists(input: string): Promise<boolean> {
+    const path = safeMirrorPath(input);
+    return this.vault.getAbstractFileByPath(path) !== null || await this.vault.adapter.exists(path);
+  }
 
   async read(input: string): Promise<string | null> {
     const path = safeMirrorPath(input);
@@ -777,6 +764,21 @@ export class ObsidianMirrorFileSystem implements MirrorFileSystem {
     } else {
       await this.vault.create(path, value);
     }
+  }
+
+  async move(sourceInput: string, targetInput: string): Promise<void> {
+    const source = safeMirrorPath(sourceInput);
+    const target = safeMirrorPath(targetInput);
+    const file = this.vault.getAbstractFileByPath(source);
+    if (!(file instanceof TFile)) {
+      throw new SyncError("mirror_path_collision", `Expected a file at ${source}.`);
+    }
+    if (this.vault.getAbstractFileByPath(target) !== null || await this.vault.adapter.exists(target)) {
+      throw new SyncError("mirror_path_collision", `A file or folder blocks the mirror path ${target}.`);
+    }
+    const slash = target.lastIndexOf("/");
+    if (slash >= 0) await ensureFolder(this.vault, target.slice(0, slash));
+    await this.vault.rename(file, target);
   }
 
   async remove(input: string): Promise<void> {
@@ -1253,10 +1255,8 @@ export class ConnectSyncController {
   async preview(): Promise<MdbaseSyncPreview> {
     const profile = this.requireProfile();
     await this.assertMirror(profile.collectionId);
-    const state = await this.stateStoreFor(profile).read();
-    return state
-      ? this.previewIncremental(profile, state)
-      : this.previewInitial(profile, "initial");
+    const mirror = await this.createMirror();
+    return previewFromPlan(await mirror.inspect());
   }
 
   async status(): Promise<MirrorStatus | null> {
@@ -1267,7 +1267,10 @@ export class ConnectSyncController {
     return mirror.status();
   }
 
-  async sync(onProgress?: (progress: MirrorProgress) => void): Promise<MirrorStatus> {
+  async sync(
+    reviewed: MdbaseSyncPreview,
+    onProgress?: (progress: MirrorProgress) => void,
+  ): Promise<MirrorApplyResult> {
     if (this.syncAbort) {
       throw new SyncError("mirror_busy", "Synchronization is already running for this vault.");
     }
@@ -1279,9 +1282,9 @@ export class ConnectSyncController {
         this.progress = next;
         onProgress?.({ ...next });
       }, abort.signal);
-      await mirror.sync();
+      const outcome = await mirror.apply(reviewed.plan, { signal: abort.signal });
       abortIfNeeded(abort.signal);
-      return mirror.status();
+      return outcome;
     } finally {
       this.progress = null;
       this.syncAbort = null;
@@ -1296,15 +1299,13 @@ export class ConnectSyncController {
     return this.syncAbort !== null;
   }
 
-  async resolveConflict(recordId: string, resolution: "local" | "remote"): Promise<MirrorStatus> {
+  async resolveConflict(
+    objectId: string,
+    decisionId: string,
+    resolution: "local" | "remote",
+  ): Promise<MirrorStatus> {
     const mirror = await this.createMirror();
-    await mirror.resolveConflict(recordId, resolution);
-    return mirror.status();
-  }
-
-  async resolveFileConflict(fileId: string, resolution: "local" | "remote"): Promise<MirrorStatus> {
-    const mirror = await this.createMirror();
-    await mirror.resolveFileConflict(fileId, resolution);
+    await mirror.resolveConflict(objectId, decisionId, resolution);
     return mirror.status();
   }
 
@@ -1589,237 +1590,6 @@ export class ConnectSyncController {
       ? parsed.name.trim()
       : this.app.vault.getName();
     return { collectionId, displayName };
-  }
-
-  private async previewInitial(
-    profile: MirrorProfile,
-    phase: "initial" | "rebuild",
-  ): Promise<MdbaseSyncPreview> {
-    const mirror = await this.createMirror();
-    const base = await mirror.previewInitialization();
-    const transport = await this.transportFor(profile);
-    const session = await transport.openSession();
-    const policy = normalizeSelectiveSync(profile.selectiveSync);
-    const entries: SyncPreviewEntry[] = [];
-    const remotePaths = new Set<string>();
-    const remoteBinaryPaths = new Set<string>();
-
-    const compareRemote = async (path: string, document: string, detail: string): Promise<void> => {
-      remotePaths.add(path);
-      const local = await this.fileSystem.read(path);
-      if (local === document) return;
-      entries.push(local === null ? {
-        kind: "document",
-        path,
-        direction: "download",
-        action: "create",
-        detail,
-      } : {
-        kind: "document",
-        path,
-        direction: "attention",
-        action: "replace",
-        detail: "A different local file already uses this hosted path.",
-      });
-    };
-
-    for (const resource of session.resources.documents ?? []) {
-      await compareRemote(resource.path, resource.document, `Download hosted ${resource.kind}.`);
-    }
-    let page: string | undefined;
-    do {
-      const snapshot = await transport.snapshot(session.snapshot_id, page);
-      for (const record of snapshot.records) {
-        await compareRemote(record.path, record.document, "Download hosted document.");
-      }
-      page = snapshot.next_page;
-    } while (page);
-
-    if (policy.file_classes.length) {
-      let filePage: string | undefined;
-      do {
-        const snapshot = await transport.fileSnapshot(session.snapshot_id, filePage);
-        for (const file of snapshot.files) {
-          assertVisibleBinaryPath(file.path);
-          if (!binaryPathSelected(policy, file.path, file.media_class)) continue;
-          remoteBinaryPaths.add(file.path);
-          const local = await this.fileSystem.inspectBinary(file.path);
-          if (local?.size === file.size && local.content_digest === file.content_digest) continue;
-          entries.push(local === null ? {
-            kind: "file",
-            path: file.path,
-            direction: "download",
-            action: "create",
-            detail: `Download hosted ${file.media_class} file · ${formatByteCount(file.size)}.`,
-            fileId: file.file_id,
-          } : {
-            kind: "file",
-            path: file.path,
-            direction: "attention",
-            action: "replace",
-            detail: "A different local file already uses this hosted path.",
-            fileId: file.file_id,
-          });
-        }
-        filePage = snapshot.next_page;
-      } while (filePage);
-    }
-
-    if (profile.mode === "read_write") {
-      const resourcePaths = new Set((session.resources.documents ?? []).map((resource) => resource.path));
-      const configuration = await loadMdbaseConfig(this.app.vault);
-      const localPaths = (await this.fileSystem.listMarkdown(resourcePaths))
-        .filter((path) => !remotePaths.has(path))
-        .filter((path) => !configuration || !isExcluded(path, configuration));
-      const invalid = new Set(base.local_issues.map((issue) => issue.path));
-      for (const path of localPaths) {
-        if (invalid.has(path)) continue;
-        entries.push({
-          kind: "document",
-          path,
-          direction: "upload",
-          action: "create",
-          detail: "Add this local document to the hosted collection.",
-        });
-      }
-      if (policy.file_classes.length && this.fileSystem.listBinary) {
-        const localBinaryPaths = (await this.fileSystem.listBinary(new Set([...resourcePaths, ...remotePaths])))
-          .filter((path) => binaryPathSelected(policy, path))
-          .filter((path) => !remoteBinaryPaths.has(path))
-          .filter((path) => !configuration || !isExcluded(path, configuration));
-        for (const path of localBinaryPaths) {
-          entries.push({
-            kind: "file",
-            path,
-            direction: "upload",
-            action: "create",
-            detail: "Add this local file to the hosted collection.",
-          });
-        }
-      }
-    }
-    for (const issue of base.local_issues) {
-      entries.push({
-        kind: "document",
-        path: issue.path,
-        direction: "attention",
-        action: "fix",
-        detail: issue.message,
-      });
-    }
-
-    return {
-      ...base,
-      phase,
-      entries: deduplicatePreviewEntries(flagConcurrentFileChanges(entries)),
-      cursor: null,
-      remoteHead: session.head,
-    };
-  }
-
-  private async previewIncremental(
-    profile: MirrorProfile,
-    state: MirrorState,
-  ): Promise<MdbaseSyncPreview> {
-    const policy = normalizeSelectiveSync(profile.selectiveSync);
-    if (JSON.stringify(normalizeSelectiveSync(state.selective_sync)) !== JSON.stringify(policy)) {
-      return this.previewInitial(profile, "rebuild");
-    }
-    const transport = await this.transportFor(profile);
-    const session = await transport.openSession();
-    const events: SyncChange[] = [];
-    let cursor = state.cursor;
-    let remoteHead = session.head;
-    while (true) {
-      const page = await transport.changes(cursor, 200);
-      remoteHead = page.head;
-      if (page.scope_epoch !== state.scope_epoch || page.reset_required) {
-        return this.previewInitial(profile, "rebuild");
-      }
-      events.push(...page.events);
-      cursor = page.cursor;
-      if (!page.has_more) break;
-    }
-
-    const resourcePaths = new Set(Object.keys(state.resources ?? {}));
-    const configuration = await loadMdbaseConfig(this.app.vault);
-    const localPaths = (await this.fileSystem.listMarkdown(resourcePaths))
-      .filter((path) => !configuration || !isExcluded(path, configuration));
-    const pathsToRead = new Set([
-      ...localPaths,
-      ...Object.values(state.records).map((entry) => entry.path),
-    ]);
-    const documents = new Map<string, string | null>();
-    await Promise.all([...pathsToRead].map(async (path) => {
-      documents.set(path, await this.fileSystem.read(path));
-    }));
-
-    const binaryPaths = policy.file_classes.length && this.fileSystem.listBinary
-      ? (await this.fileSystem.listBinary(new Set([...resourcePaths, ...localPaths])))
-        .filter((path) => binaryPathSelected(policy, path))
-        .filter((path) => !configuration || !isExcluded(path, configuration))
-      : [];
-    const binary = new Map<string, MirrorBinaryInfo>();
-    await Promise.all(binaryPaths.map(async (path) => {
-      const info = await this.fileSystem.inspectBinary(path);
-      if (info) binary.set(path, info);
-    }));
-
-    const entries = [
-      ...remoteChangeEntries(state, events),
-      ...remoteFileChangeEntries(state, events, (file) => binaryPathSelected(policy, file.path, file.media_class)),
-      ...localChangeEntries(state, documents, localPaths, resourcePaths, portableMirrorRuntime.digest),
-      ...localFileChangeEntries(state, binary, binaryPaths),
-    ];
-    for (const [recordId, receipt] of Object.entries(state.conflicts ?? {})) {
-      const pending = state.pending?.find((item) => item.mutation.record_id === recordId);
-      const path = pending?.local_path ?? state.records[recordId]?.path ?? "Unknown document";
-      entries.push({
-        kind: "document",
-        path,
-        direction: "attention",
-        action: "fix",
-        detail: receipt.status === "conflicted"
-          ? "Local and hosted changes need a decision."
-          : receipt.status === "rejected"
-            ? receipt.error.message
-            : "A queued local change needs review.",
-        recordId,
-      });
-    }
-    for (const issue of Object.values(state.local_issues ?? {})) {
-      entries.push({
-        kind: "document",
-        path: issue.path,
-        direction: "attention",
-        action: "fix",
-        detail: issue.message,
-      });
-    }
-    for (const conflict of Object.values(state.file_conflicts ?? {})) {
-      entries.push({
-        kind: "file",
-        path: conflict.path,
-        direction: "attention",
-        action: "fix",
-        detail: conflict.message,
-        fileId: conflict.file_id,
-      });
-    }
-
-    return summarizePreview({
-      already_initialized: true,
-      unchanged_documents: Math.max(0, Object.keys(state.records).length
-        - events.filter((event) => event.type === "put" || event.type === "remove").length),
-      unchanged_files: Math.max(0, Object.keys(state.files ?? {}).length
-        - events.filter((event) => event.type === "file_put" || event.type === "file_remove").length),
-      collisions: [],
-      local_issues: Object.values(state.local_issues ?? {}).map(({ path, code, message }) => ({ path, code, message })),
-      phase: "incremental",
-      entries: deduplicatePreviewEntries(flagConcurrentFileChanges(entries)),
-      cursor: state.cursor,
-      remoteHead,
-    });
   }
 
   private stateStoreFor(profile: MirrorProfile): MirrorStateStore {
