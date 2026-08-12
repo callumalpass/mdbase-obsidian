@@ -49,6 +49,11 @@ import {
   setFieldMapping,
   typeFieldsForModel,
 } from "./typeContracts";
+
+declare const __MDBASE_CONNECT_CONTROL_URL__: string;
+const DEFAULT_CONNECT_CONTROL_URL = typeof __MDBASE_CONNECT_CONTROL_URL__ === "string"
+  ? __MDBASE_CONNECT_CONTROL_URL__
+  : "https://connect.mdbase.dev";
 import {
   describeTypeChanges,
   type TypeDraftChange,
@@ -268,7 +273,7 @@ export class MdbaseWorkspaceView extends ItemView {
   private issueLimit = 250;
   private enrollmentVerification = "";
   private enrollmentAbort: AbortController | null = null;
-  private enrollmentControlUrl = "https://connect.mdbase.dev";
+  private enrollmentControlUrl = DEFAULT_CONNECT_CONTROL_URL;
   private enrollmentMirrorName = "Obsidian";
   private enrollmentCollectionId = "";
   private enrollmentMode: "read_only" | "read_write" = "read_write";
@@ -1683,7 +1688,7 @@ export class MdbaseWorkspaceView extends ItemView {
     }
     inputRow(section, "Connect URL", this.enrollmentControlUrl, (value) => {
       this.enrollmentControlUrl = value;
-    }, { placeholder: "https://connect.mdbase.dev" });
+    }, { placeholder: DEFAULT_CONNECT_CONTROL_URL });
     inputRow(section, "Mirror name", this.enrollmentMirrorName, (value) => {
       this.enrollmentMirrorName = value;
     });
@@ -1784,7 +1789,7 @@ export class MdbaseWorkspaceView extends ItemView {
     if (!checkpoint) {
       inputRow(section, "Connect URL", this.enrollmentControlUrl, (value) => {
         this.enrollmentControlUrl = value;
-      }, { placeholder: "https://connect.mdbase.dev" });
+      }, { placeholder: DEFAULT_CONNECT_CONTROL_URL });
       inputRow(section, "Mirror name", this.enrollmentMirrorName, (value) => {
         this.enrollmentMirrorName = value;
       });

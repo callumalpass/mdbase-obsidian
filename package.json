@@ -7,8 +7,10 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "build:staging": "tsc -noEmit -skipLibCheck && MDBASE_CONNECT_CONTROL_URL=https://connect-staging.mdbase.dev node esbuild.config.mjs production",
     "check:mobile": "npm run build && node scripts/check-mobile.mjs",
     "build:test": "npm run build && node copy-files.mjs",
+    "build:test:staging": "npm run build:staging && node copy-files.mjs",
     "profile:testvault": "node scripts/profile-testvault.mjs",
     "test": "npm run test:unit",
     "test:unit": "tsc -p tsconfig.test.json && node --experimental-specifier-resolution=node --loader ./test/obsidian-loader.mjs --test .test-dist/test/**/*.test.js",

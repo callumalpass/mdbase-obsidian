@@ -131,14 +131,18 @@ Additional gates:
 npm run check:mobile
 npm run profile:testvault
 npm run build:test
+npm run build:test:staging
 ```
 
-`build:test` copies the built plugin to the configured test vaults.
-`profile:testvault` scans `/home/calluma/testvault/test` without writing it and
-enforces checked-in schema, migration-analysis, validation, and issue-render
-budgets.
+`build:test` copies the production-default build to configured test vaults.
+`build:test:staging` builds the enrollment UI with
+`https://connect-staging.mdbase.dev` as its default and copies that exact bundle.
+`profile:testvault` scans the registered Obsidian vault named `test` without
+writing it and enforces checked-in schema, migration-analysis, validation, and
+issue-render budgets. Set `OBSIDIAN_TEST_VAULT` to profile another registered
+disposable vault with the exact installed bundle.
 
-The Connect protocol and sync SDKs are pinned to `0.1.0-beta.31`, and mdbase
+The Connect protocol and sync SDKs are pinned to `0.1.0-beta.68`, and mdbase
 interop is pinned to `0.1.0-rc.2`. Update `package.json`, regenerate
 `package-lock.json`, and rerun the binary round-trip and mobile gates when
 advancing them.

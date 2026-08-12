@@ -2,7 +2,7 @@ import * as assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 import type { CollectionFileDescriptor } from "@mdbase-dev/connect-protocol";
-import { ObsidianSyncTransport } from "../src/connectSync";
+import { ObsidianSyncTransport, resilientRequestUrl } from "../src/connectSync";
 
 const authorityId = "11111111-1111-4111-8111-111111111111";
 const syncUrl = `https://connect.example/v1/authorities/${authorityId}/sync`;
@@ -30,6 +30,43 @@ async function collect(source: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
   for await (const chunk of source) parts.push(...chunk);
   return Uint8Array.from(parts);
 }
+
+test("HTTP adapter falls back to fetch only when Obsidian's native bridge fails", async () => {
+  let fetchCalls = 0;
+  const result = await resilientRequestUrl({
+    url: "https://connect.example/probe",
+    method: "POST",
+    headers: { "x-probe": "one" },
+    contentType: "application/json",
+    body: JSON.stringify({ exact: true }),
+    throw: false,
+  }, async () => {
+    throw new Error("net::ERR_FAILED");
+  }, async (_input, init) => {
+    fetchCalls += 1;
+    assert.equal(init?.method, "POST");
+    assert.equal(new Headers(init?.headers).get("content-type"), "application/json");
+    assert.equal(init?.body, JSON.stringify({ exact: true }));
+    return new Response(JSON.stringify({ recovered: true }), {
+      status: 201,
+      headers: { "content-type": "application/json", "x-result": "fallback" },
+    });
+  });
+  assert.equal(fetchCalls, 1);
+  assert.equal(result.status, 201);
+  assert.deepEqual(result.json, { recovered: true });
+  assert.equal(result.headers["x-result"], "fallback");
+  assert.equal(new TextDecoder().decode(result.arrayBuffer), result.text);
+
+  fetchCalls = 0;
+  const native = await resilientRequestUrl({ url: "https://connect.example/probe", throw: false }, async () =>
+    response(503, { error: { code: "busy" } }) as never, async () => {
+      fetchCalls += 1;
+      return new Response();
+    });
+  assert.equal(native.status, 503);
+  assert.equal(fetchCalls, 0);
+});
 
 test("Obsidian HTTP transport downloads bounded binary parts and cleans up the transfer", async () => {
   const bytes = Uint8Array.of(0, 1, 2, 3, 254, 255);

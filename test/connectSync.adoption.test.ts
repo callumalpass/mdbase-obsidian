@@ -29,6 +29,7 @@ class TestVault {
   private readonly files = new Map<string, { file: TFile; content: string }>();
   private readonly binaryFiles = new Map<string, { file: TFile; content: ArrayBuffer }>();
   private readonly folders = new Set<string>();
+  onReadBinary: (() => void) | null = null;
 
   readonly adapter = {
     exists: async (path: string) => this.files.has(normalizePath(path)) || this.binaryFiles.has(normalizePath(path)) || this.folders.has(normalizePath(path)),
@@ -90,6 +91,7 @@ class TestVault {
   }
 
   async readBinary(file: TFile): Promise<ArrayBuffer> {
+    this.onReadBinary?.();
     const content = this.binaryFiles.get(file.path)?.content;
     if (!content) throw new Error(`Missing binary file: ${file.path}`);
     return content.slice(0);
@@ -406,6 +408,34 @@ test("adoption includes selected binary files and supplies their exact bytes", a
     ["Attachments/evidence.png", "image", bytes.byteLength],
   ]);
   assert.deepEqual(adoption.uploadedFileBytes.at(-1), [bytes]);
+});
+
+test("adoption snapshot cancellation stops before hashing the next heavy file", async () => {
+  const { vault, adoption, controller } = await fixture();
+  await vault.putBinary("Attachments/first.png", new Uint8Array(8 * 1024 * 1024));
+  await vault.putBinary("Attachments/second.png", new Uint8Array(8 * 1024 * 1024));
+  const abort = new AbortController();
+  let binaryReads = 0;
+  vault.onReadBinary = () => {
+    binaryReads += 1;
+    abort.abort();
+  };
+
+  await assert.rejects(
+    controller.adoptLocalCollection({
+      controlUrl: "https://connect.example",
+      mirrorName: "Obsidian",
+      selectiveSync: { file_classes: ["image"], excluded_folders: [] },
+    }, { ...callbacks, signal: abort.signal }),
+    (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+  );
+  assert.equal(binaryReads, 1);
+  assert.equal(adoption.uploads.length, 0);
+  assert.equal(controller.getAdoptionMarker()?.phase, "waiting_for_approval");
+
+  vault.onReadBinary = null;
+  await controller.cancelAdoption();
+  assert.equal(controller.getAdoptionMarker(), null);
 });
 
 test("a lost activation response keeps the exact snapshot fenced across restart", async () => {

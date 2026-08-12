@@ -23,8 +23,8 @@ jobs:
         run: npm ci
       - name: Test
         run: npm test
-      - name: Build
-        run: npm run build
+      - name: Build and validate mobile bundle
+        run: npm run check:mobile
       - name: Validate release assets
         run: >-
           node -e "const fs=require('node:fs'); for (const file of

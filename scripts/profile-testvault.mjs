@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 const baseline = JSON.parse(
   await readFile(new URL("./testvault-profile-baseline.json", import.meta.url), "utf8"),
 );
+const vault = process.env.OBSIDIAN_TEST_VAULT?.trim() || "test";
 const expression = `(async()=>{
   const plugin=app.plugins.plugins['mdbase-obsidian'];
   if(!plugin)throw new Error('mdbase-obsidian is not loaded');
@@ -30,7 +31,7 @@ const expression = `(async()=>{
     heap_after:heapAfter
   });
 })()`;
-const result = spawnSync("obsidian", ["vault=test", "eval", `code=${expression}`], {
+const result = spawnSync("obsidian", [`vault=${vault}`, "eval", `code=${expression}`], {
   encoding: "utf8",
   timeout: 30_000,
 });
@@ -48,5 +49,5 @@ for (const [metric, limit] of Object.entries(baseline.maximums)) {
     failures.push(`${metric}=${profile[metric]} exceeds ${limit}`);
   }
 }
-console.log(JSON.stringify({ profile, baseline, passed: failures.length === 0 }, null, 2));
+console.log(JSON.stringify({ vault, profile, baseline, passed: failures.length === 0 }, null, 2));
 if (failures.length) throw new Error(`Performance regression: ${failures.join("; ")}`);

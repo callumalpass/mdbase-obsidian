@@ -3,6 +3,8 @@ import {
   normalizePath,
   parseYaml,
   requestUrl,
+  type RequestUrlParam,
+  type RequestUrlResponse,
   stringifyYaml,
   TFile,
   TFolder,
@@ -289,10 +291,63 @@ function retryAfterMilliseconds(headers: Record<string, string>): number | undef
   return undefined;
 }
 
+/**
+ * Obsidian's native request bridge occasionally fails before producing an HTTP
+ * response (observed as net::ERR_FAILED in desktop 1.13.7). The web fetch path
+ * is a safe fallback for Connect and prepared object-storage URLs and keeps the
+ * same response shape used by the rest of this adapter.
+ */
+export async function resilientRequestUrl(
+  request: RequestUrlParam,
+  primary: (request: RequestUrlParam | string) => Promise<RequestUrlResponse> = requestUrl,
+  fallback: typeof fetch = fetch,
+): Promise<RequestUrlResponse> {
+  try {
+    return await primary(request);
+  } catch (primaryError) {
+    let response: Response;
+    try {
+      const headers = new Headers(request.headers);
+      if (request.contentType && !headers.has("content-type")) headers.set("content-type", request.contentType);
+      response = await fallback(request.url, {
+        method: request.method,
+        headers,
+        body: request.body,
+      });
+    } catch {
+      throw primaryError;
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    const text = new TextDecoder().decode(arrayBuffer);
+    let json: unknown = null;
+    if (text.trim()) {
+      try {
+        json = JSON.parse(text);
+      } catch {
+        json = null;
+      }
+    }
+    if (request.throw !== false && response.status >= 400) {
+      throw new Error(`Request failed with status ${response.status}`);
+    }
+    const responseHeaders: Record<string, string> = {};
+    response.headers.forEach((value, name) => {
+      responseHeaders[name] = value;
+    });
+    return {
+      status: response.status,
+      headers: responseHeaders,
+      arrayBuffer,
+      json,
+      text,
+    };
+  }
+}
+
 export function createObsidianEnrollmentRequester(): MirrorEnrollmentRequester {
   return async (request) => {
     if (request.signal?.aborted) throw new DOMException("Enrollment cancelled.", "AbortError");
-    const response = await requestUrl({
+    const response = await resilientRequestUrl({
       url: request.url,
       method: request.method,
       headers: request.headers,
@@ -313,7 +368,7 @@ export function createObsidianAdoptionRequester(): AuthorityAdoptionRequester {
   return async (request) => {
     if (request.signal?.aborted) throw new DOMException("Collection adoption cancelled.", "AbortError");
     const body = await adoptionRequestBody(request.body, request.rawBody);
-    const response = await requestUrl({
+    const response = await resilientRequestUrl({
       url: request.url,
       method: request.method,
       headers: request.headers,
@@ -344,7 +399,7 @@ implements SyncTransport<Frontmatter> {
   constructor(
     syncUrl: string,
     private readonly accessToken: string,
-    private readonly send: typeof requestUrl = requestUrl,
+    private readonly send: (request: RequestUrlParam) => Promise<RequestUrlResponse> = resilientRequestUrl,
   ) {
     let endpoint: URL;
     try {
@@ -1347,13 +1402,13 @@ export class ConnectSyncController {
       const prepared = marker.phase === "waiting_for_approval"
         ? await this.adoptionClient.waitForApproval(session, callbacks)
         : await this.requirePreparedAdoption(session, callbacks);
-      const warmSnapshot = await this.captureAuthoritySnapshot(session.requested.collectionId);
+      const warmSnapshot = await this.captureAuthoritySnapshot(session.requested.collectionId, callbacks.signal);
       await this.updateAdoptionPhase("uploading");
       await this.adoptionClient.uploadSnapshot(session, prepared, warmSnapshot, this.adoptionUploadOptions(session, callbacks));
 
       // From this point local plugin writes are stopped. Any external file edit is
       // a pending mirror write, not part of the authority snapshot being activated.
-      const finalSnapshot = await this.captureAuthoritySnapshot(session.requested.collectionId);
+      const finalSnapshot = await this.captureAuthoritySnapshot(session.requested.collectionId, callbacks.signal);
       await this.writeAdoptionSnapshot(finalSnapshot);
       await this.updateAdoptionPhase("fenced", finalSnapshot);
       const finalPrepared = await this.requirePreparedAdoption(session, callbacks);
@@ -1446,12 +1501,18 @@ export class ConnectSyncController {
     return this.requireProfile();
   }
 
-  private async captureAuthoritySnapshot(collectionId: string): Promise<AuthorityImportSnapshot> {
+  private async captureAuthoritySnapshot(
+    collectionId: string,
+    signal?: AbortSignal,
+  ): Promise<AuthorityImportSnapshot> {
+    abortIfNeeded(signal);
     const config = await loadMdbaseConfig(this.app.vault);
+    abortIfNeeded(signal);
     if (!config) {
       throw new SyncError("invalid_collection_configuration", "A valid mdbase.yaml is required.");
     }
     const configuration = await this.app.vault.adapter.read("mdbase.yaml");
+    abortIfNeeded(signal);
     const rawConfiguration = parseYaml(configuration);
     const resources: Array<{ path: string; kind: "configuration" | "type" | "view"; document: string }> = [{
       path: "mdbase.yaml",
@@ -1463,11 +1524,13 @@ export class ConnectSyncController {
       .filter((file) => normalizePath(file.path).startsWith(typesPrefix))
       .sort((left, right) => left.path.localeCompare(right.path));
     for (const typeFile of typeFiles) {
+      abortIfNeeded(signal);
       resources.push({
         path: normalizePath(typeFile.path),
         kind: "type",
         document: await this.app.vault.cachedRead(typeFile),
       });
+      abortIfNeeded(signal);
     }
     const viewPatterns = configuredBasePatterns(rawConfiguration);
     if (viewPatterns.length) {
@@ -1477,18 +1540,22 @@ export class ConnectSyncController {
         .filter((file) => matches.some((match) => match(normalizePath(file.path))))
         .sort((left, right) => left.path.localeCompare(right.path));
       for (const file of baseFiles) {
+        abortIfNeeded(signal);
         resources.push({
           path: normalizePath(file.path),
           kind: "view",
           document: await this.app.vault.cachedRead(file),
         });
+        abortIfNeeded(signal);
       }
     }
     const records = [];
     for (const file of this.app.vault.getMarkdownFiles().sort((left, right) => left.path.localeCompare(right.path))) {
+      abortIfNeeded(signal);
       const path = normalizePath(file.path);
       if (isExcluded(path, config)) continue;
       const document = await this.app.vault.cachedRead(file);
+      abortIfNeeded(signal);
       records.push({
         path,
         document,
@@ -1502,11 +1569,16 @@ export class ConnectSyncController {
         .filter((path) => binaryPathSelected(policy, path))
         .filter((path) => !isExcluded(path, config));
       for (const path of binaryPaths) {
+        abortIfNeeded(signal);
         const source = await this.fileSystem.readBinary?.(path);
+        abortIfNeeded(signal);
         if (!source) continue;
         const bytes = await collectBinary(source);
+        abortIfNeeded(signal);
         const info = await binaryInfo(bytes);
+        abortIfNeeded(signal);
         await blobStore.write(info.content_digest, (async function* () { yield new Uint8Array(bytes); })());
+        abortIfNeeded(signal);
         const file = this.app.vault.getAbstractFileByPath(path);
         files.push({
           file_id: portableRecordId(collectionId, `file:${path}`),
@@ -1519,6 +1591,7 @@ export class ConnectSyncController {
         });
       }
     }
+    abortIfNeeded(signal);
     return buildPortableAuthoritySnapshot({
       collectionId,
       sourceHead: 0,
